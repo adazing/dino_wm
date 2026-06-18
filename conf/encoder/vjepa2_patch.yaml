@@ -1,0 +1,6 @@
+# V-JEPA2 patch tokens (via transformers).
+_target_: models.encoder.VJEPA2.VJEPA2Encoder
+name: "vjepa2"
+feature_key: "x_norm_patchtokens"
+output_dim: 1024
+n_patches: 256

@@ -1,0 +1,7 @@
+# DINOv3 patch tokens
+_target_: models.encoder.dinoV3.DinoV3Encoder
+name: "dinov3_vits14"
+feature_key: "x_norm_patchtokens"
+output_dim: 384
+plus: true
+n_patches: 196

@@ -1,3 +1,6 @@
-_target_: models.dino.DinoV2Encoder
+# DINOv2 CLS token
+_target_: models.encoder.dino.DinoV2Encoder
 name: "dinov2_vits14"
 feature_key: "x_norm_clstoken"
+output_dim: 384
+n_patches: 1

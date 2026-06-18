@@ -1,0 +1,6 @@
+# SigLIP2 patch tokens (via transformers).
+_target_: models.encoder.SigLIP2Encoder.SigLIP2Encoder
+name: "sigLIP2"
+feature_key: "x_norm_patchtokens"
+output_dim: 768
+n_patches: 196

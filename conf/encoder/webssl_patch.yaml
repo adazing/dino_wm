@@ -1,0 +1,6 @@
+# WebSSL patch tokens (via transformers).
+_target_: models.encoder.webSSL.WebSSLEncoder
+name: "webSSL"
+feature_key: "x_norm_patchtokens"
+output_dim: 1024
+n_patches: 256

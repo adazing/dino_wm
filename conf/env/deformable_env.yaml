@@ -1,9 +1,15 @@
 name: deformable_env
 args: []
-kwargs: 
+kwargs:
   object_name: "granular"
 
 load_dir: ""
+
+# action / goal / view dims for the BC policy
+# action is [x_start, z_start, x_end, z_end]
+act_dim: 4
+goal_dim: 0
+views: 1
 
 dataset:
   _target_: "datasets.deformable_env_dset.load_deformable_dset_slice_train_val"

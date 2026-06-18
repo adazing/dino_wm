@@ -1,0 +1,10 @@
+# ResNet18 patch tokens from layer3. At 224x224 this gives 14x14 = 196 patches.
+# Set ckpt_path to load pretrained encoder weights (e.g. a DynaMo snapshot).
+_target_: models.encoder.resnet.Resnet18Patches
+pretrained: True
+output_dim: 256
+unit_norm: False
+ckpt_path: null
+return_layers:
+  - layer3
+n_patches: 196

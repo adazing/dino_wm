@@ -1,0 +1,6 @@
+# ImageNet ResNet18, global-pooled to a single 512-d token.
+_target_: models.encoder.resnet.resnet18
+pretrained: True
+output_dim: 512
+unit_norm: False
+n_patches: 1

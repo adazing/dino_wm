@@ -40,3 +40,8 @@ objective:
   alpha: 1
   base: 2 # coeff base for weighting all frames. Only applies when mode == 'all'
   mode: last
+
+# --- generate_planned_trajectories.py only (ignored by plan.py) ---
+n_planning_rounds: 1                # number of planning rounds; total trajs = rounds * n_evals
+planned_out_path: ./planned_trajectories.pth
+planned_only_successes: false       # keep only trajectories that reached the goal

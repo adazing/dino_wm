@@ -75,6 +75,7 @@ def eval_images(img1, img2, item_only=True):
     metrics['l2'] = l2_loss(img1, img2)
     metrics['ssim'] = ssim(img1, img2)
     metrics['mse'] = mse(img1, img2)
-    metrics['psnr'] = psnr(img1, img2)
-    metrics['lpips'] = lpips(img1, img2, net_type='vgg')
+    metrics['psnr'] = psnr(img1, img2)  # PSNR/SSIM constants assume [0,1] inputs
+    # LPIPS expects [-1,1]; images are in [0,1], so rescale.
+    metrics['lpips'] = lpips(img1 * 2 - 1, img2 * 2 - 1, net_type='vgg')
     return metrics

@@ -73,6 +73,28 @@ class SerialVectorEnv:
         infos = tuple(infos)
         return obses, rewards, dones, infos
 
+    def close(self):
+        for env in self.envs:
+            if hasattr(env, "close"):
+                env.close()
+
+    def step(self, actions):
+        """Closed-loop single step per env, built on each env's step_multiple
+        (length-1 action sequence) so per-env obs processing matches rollout().
+
+        actions: (num_envs, action_dim)
+        returns: obs (dict, each key (num_envs, ...)), rewards, dones,
+                 info (tuple of num_envs dicts, each with "state").
+        """
+        obses, rewards, dones, infos = [], [], [], []
+        for i in range(self.num_envs):
+            o, r, d, info = self.envs[i].step_multiple([actions[i]])
+            obses.append({k: v[0] for k, v in o.items()})
+            rewards.append(np.asarray(r).reshape(-1)[0] if np.ndim(r) > 0 else r)
+            dones.append(np.asarray(d).reshape(-1)[0] if np.ndim(d) > 0 else d)
+            infos.append({k: v[0] for k, v in info.items()})
+        return aggregate_dct(obses), np.array(rewards), np.array(dones), tuple(infos)
+
     def rollout(self, seed, init_state, actions):
         """
         only returns np arrays of observations and states

@@ -808,7 +808,7 @@ class Trainer:
             img_name,
             nrow=num_columns,
             normalize=True,
-            value_range=(-1, 1),
+            value_range=(0, 1),  # visuals are in [0, 1]
         )
 
 

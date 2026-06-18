@@ -2,6 +2,11 @@ name: point_maze
 args: []
 kwargs: {}
 
+# action / goal / view dims for the BC policy
+act_dim: 2
+goal_dim: 0
+views: 1
+
 dataset:
   _target_: "datasets.point_maze_dset.load_point_maze_slice_train_val"
   n_rollout: null

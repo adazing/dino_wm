@@ -859,10 +859,15 @@ class BaseVectorEnv(object):
                 self.ready_id.append(env_id)
         return_lists = tuple(zip(*result))
         obs_list = return_lists[0]
-        try:
-            obs_stack = np.stack(obs_list)
-        except ValueError:  # different len(obs)
-            obs_stack = np.array(obs_list, dtype=object)
+        if isinstance(obs_list[0], dict):
+            # dict observations (dino_wm envs): merge like rollout() does instead
+            # of np.stack, so step() supports closed-loop dict-obs envs.
+            obs_stack = aggregate_dct(list(obs_list))
+        else:
+            try:
+                obs_stack = np.stack(obs_list)
+            except ValueError:  # different len(obs)
+                obs_stack = np.array(obs_list, dtype=object)
         other_stacks = map(np.stack, return_lists[1:])
         return (obs_stack, *other_stacks)  # type: ignore
     

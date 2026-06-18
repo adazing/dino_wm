@@ -1,8 +1,13 @@
 name: pusht
 args: []
-kwargs: 
+kwargs:
   with_velocity: true
   with_target: true
+
+# action / goal / view dims for the BC policy
+act_dim: 2
+goal_dim: 0
+views: 1
 
 dataset:
   _target_: "datasets.pusht_dset.load_pusht_slice_train_val"

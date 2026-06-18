@@ -1,0 +1,6 @@
+# Load a whole pretrained encoder saved with torch.save(model).
+# Set f to the checkpoint path.
+_target_: models.encoder.from_ckpt.from_ckpt
+f: ???
+output_dim: 512
+n_patches: 1

@@ -1,0 +1,20 @@
+# VQ-BeT (CBeT) behavior-cloning policy.
+_target_: models.vq_behavior_transformer.bet.BehaviorTransformer
+obs_dim: ${encoder.output_dim}
+act_dim: ${env.act_dim}
+goal_dim: ${env.goal_dim}
+views: ${env.views}
+n_patches: ${encoder.n_patches}
+vqvae_latent_dim: 512
+vqvae_n_embed: 16
+vqvae_groups: 2
+vqvae_fit_steps: 44
+vqvae_iters: 1000
+n_layer: 8
+n_head: 8
+n_embd: 512
+vqvae_batch_size: 1024
+act_scale: 500
+obs_window_size: ${window_size}
+act_window_size: ${action_window_size}
+offset_loss_multiplier: 10

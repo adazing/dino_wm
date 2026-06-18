@@ -1,0 +1,18 @@
+# Diffusion behavior-cloning policy.
+_target_: models.diffusion_policy.diffusion_policy.DiffusionPolicy
+obs_dim: ${encoder.output_dim}
+act_dim: ${env.act_dim}
+goal_dim: ${env.goal_dim}
+views: ${env.views}
+n_patches: ${encoder.n_patches}
+obs_horizon: ${window_size}
+pred_horizon: ${eval:'${action_window_size} + ${window_size} - 1'}
+action_horizon: ${action_window_size}
+n_layer: 8
+n_head: 4
+n_embd: 256
+visual_input: true
+data_act_scale: 1
+lr: ${optim.lr}
+weight_decay: ${optim.weight_decay}
+use_transform: null

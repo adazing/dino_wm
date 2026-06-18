@@ -1,0 +1,9 @@
+# ResNet18 patch tokens from layer4. At 224x224 this gives 7x7 = 49 patches.
+_target_: models.encoder.resnet.Resnet18Patches
+pretrained: True
+output_dim: 256
+unit_norm: False
+ckpt_path: null
+return_layers:
+  - layer4
+n_patches: 49

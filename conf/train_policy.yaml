@@ -1,0 +1,56 @@
+defaults:
+  - _self_
+  - env: pusht
+  - encoder: resnet18_patch
+  - policy: vqbet
+  - override hydra/launcher: submitit_slurm
+
+# data source for BC training: original | planned | both
+data_source: original
+# file produced by generate_planned_trajectories.py (needed for planned/both)
+planned_data_path: null
+
+# condition the policy on a goal image (the trajectory's final-frame embedding).
+# false = unconditional.
+goal_conditional: false
+
+# dataset / windows
+img_size: 224
+normalize_action: true
+num_hist: 1          # only used by the env dataset loader signature
+num_pred: 1
+frameskip: 1         # BC policy uses per-step actions
+window_size: 5       # obs history length (obs_horizon)
+action_window_size: 5
+train_fraction: 0.95
+seed: 42
+embed_device: cpu    # where precomputed embeddings are cached
+
+# optim / training
+optim:
+  lr: 5.5e-5
+  weight_decay: 2e-4
+  betas: [0.9, 0.999]
+batch_size: 64
+epochs: 600
+num_workers: 8
+save_every: 50
+eval_freq: 10        # validation action-loss every N epochs
+
+# closed-loop env eval. Reports eval_state success, plus coverage for envs that
+# expose it (pusht).
+eval_on_env: true
+eval_on_env_freq: 50
+n_env_evals: 20      # must be a multiple of n_envs
+n_envs: 10
+eval_horizon: 50     # env steps per closed-loop episode
+
+wandb:
+  project: dino_wm_bc
+  entity: null
+wandb_logging: true
+experiment: ${policy._target_}_${data_source}
+
+hydra:
+  run:
+    dir: ./policy_outputs/${now:%Y%m%d%H%M%S}_${data_source}
