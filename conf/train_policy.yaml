@@ -24,7 +24,11 @@ window_size: 5       # obs history length (obs_horizon)
 action_window_size: 5
 train_fraction: 0.95
 seed: 42
-embed_device: cpu    # where precomputed embeddings are cached
+# precompute_embeddings true: encode the whole dataset once into RAM (fast, but
+# memory grows with dataset size). false: encode each batch in the train loop
+# (flat memory, slower; memory then scales with batch_size).
+precompute_embeddings: true
+embed_device: cpu    # where precomputed embeddings are cached (precompute only)
 
 # optim / training
 optim:
@@ -44,6 +48,10 @@ eval_on_env_freq: 50
 n_env_evals: 20      # must be a multiple of n_envs
 n_envs: 10
 eval_horizon: 50     # env steps per closed-loop episode
+# rollout videos from the first eval batch (goal frame on the right), saved to the run dir
+save_eval_video: true
+n_eval_videos: 3     # how many episodes to record (<= n_envs)
+eval_video_fps: 12
 
 wandb:
   project: dino_wm_bc

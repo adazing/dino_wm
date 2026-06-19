@@ -13,6 +13,7 @@ Examples:
 """
 import os
 import gym
+import tqdm
 import hydra
 import torch
 import numpy as np
@@ -58,6 +59,14 @@ def format_params(n):
     return f"{n:.1f}T"
 
 
+def _frame_to_uint8(frame):
+    """A single (H, W, C) frame (tensor or array, [0,1] or [0,255]) -> uint8 [0,255]."""
+    f = np.asarray(frame, dtype=np.float32)
+    if f.max() <= 1.5:
+        f = f * 255.0
+    return np.clip(f, 0, 255).astype(np.uint8)
+
+
 # build raw trajectory datasets
 def build_raw_dino_traj_datasets(dataset_cfg, num_hist, num_pred, frameskip):
     """Instantiate an env's trajectory datasets and return the train split only.
@@ -92,15 +101,19 @@ def main(cfg):
     goal_conditional = bool(cfg.get("goal_conditional", False))
     cfg.env.goal_dim = int(cfg.encoder.output_dim) if goal_conditional else 0
 
+    if accelerator.is_main_process:
+        print(OmegaConf.to_yaml(cfg, resolve=True))
+        print(f"Saving to {os.getcwd()}")
+
     do_wandb = accelerator.is_main_process and _HAS_WANDB and cfg.get("wandb_logging", True)
     if do_wandb:
         wandb.init(project=cfg.wandb.project, entity=cfg.wandb.entity,
                    name=str(cfg.experiment),
                    config=OmegaConf.to_container(cfg, resolve=True))
 
-    # frozen patch encoder
-    encoder = hydra.utils.instantiate(cfg.encoder)
-    encoder = accelerator.prepare(encoder)
+    # frozen patch encoder (moved to device, not DDP-wrapped: it's only used for
+    # inference, including per-batch encoding in the lazy path)
+    encoder = hydra.utils.instantiate(cfg.encoder).to(device)
     for p in encoder.parameters():
         p.requires_grad = False
     encoder.eval()
@@ -152,12 +165,14 @@ def main(cfg):
         print(f"\nCombined (Encoder + Policy):\n  Total parameters:     {format_params(enc_total + mdl_total):>10} ({enc_total + mdl_total:,})")
         print(f"  Trainable parameters: {format_params(enc_train + mdl_train):>10} ({enc_train + mdl_train:,})")
 
-    # precompute embeddings, slice, build loaders
+    # split, (optionally precompute embeddings), slice, build loaders
+    precompute = bool(cfg.get("precompute_embeddings", True))
     train_data, test_data = split_traj_datasets(
         dataset, train_fraction=cfg.train_fraction, random_seed=cfg.seed
     )
-    train_data = TrajectoryEmbeddingDataset(encoder, train_data, device=cfg.embed_device)
-    test_data = TrajectoryEmbeddingDataset(encoder, test_data, device=cfg.embed_device)
+    if precompute:
+        train_data = TrajectoryEmbeddingDataset(encoder, train_data, device=cfg.embed_device)
+        test_data = TrajectoryEmbeddingDataset(encoder, test_data, device=cfg.embed_device)
     slicer_kwargs = dict(window=cfg.window_size, action_window=cfg.action_window_size,
                          vqbet_get_future_action_chunk=False, goal_conditional=goal_conditional)
     train_data = VqbetTrajectorySlicerDataset(train_data, **slicer_kwargs)
@@ -175,23 +190,40 @@ def main(cfg):
     goal_dim = int(cfg.env.goal_dim)
 
     def run_model(batch):
+        # precompute: batch[0]/[2] are embeddings (N,T,V,P,E).
+        # lazy: they are raw images (N,T,V,C,H,W) -> encode here (frozen encoder).
         obs, act = batch[0].to(device), batch[1].to(device)
+        goal = batch[2].to(device) if goal_dim > 0 else None
+        if not precompute:
+            with torch.no_grad():
+                obs = encoder(obs)
+                if goal is not None:
+                    # goal is one frame repeated across the window: encode once
+                    gw = goal.shape[1]
+                    goal = encoder(goal[:, :1]).expand(-1, gw, -1, -1, -1)
         obs = rearrange(obs, "N T V P E -> N T (V P) E")
-        goal = None if goal_dim == 0 else rearrange(batch[2].to(device), "N T V P E -> N T (V P) E")
+        if goal is not None:
+            goal = rearrange(goal, "N T V P E -> N T (V P) E")
         return cbet_model(obs, goal, act)
 
     out_dir = Path(os.getcwd())
-    for epoch in range(cfg.epochs):
-        # closed-loop env eval (main process only)
-        if cfg.eval_on_env and (epoch + 1) % cfg.eval_on_env_freq == 0 and accelerator.is_main_process:
-            try:
-                metrics = eval_on_env(cfg, accelerator.unwrap_model(encoder),
-                                      accelerator.unwrap_model(cbet_model), device, use_diffusion)
-                print(f"eval_on_env: {metrics}")
-                if do_wandb:
-                    wandb.log({**{f"env/{k}": v for k, v in metrics.items()}, "epoch": epoch})
-            except Exception as e:
-                print(f"eval_on_env skipped: {e}")
+    metrics_history = []  # one dict per env-eval, used to report the best at the end
+    for epoch in tqdm.trange(cfg.epochs, disable=not accelerator.is_main_process):
+        # closed-loop env eval (main process only). The other ranks resync at the
+        # barrier below so DDP all-reduce in the train step doesn't desync.
+        if cfg.eval_on_env and (epoch + 1) % cfg.eval_on_env_freq == 0:
+            if accelerator.is_main_process:
+                try:
+                    metrics = eval_on_env(cfg, encoder,
+                                          accelerator.unwrap_model(cbet_model), device, use_diffusion,
+                                          epoch=epoch, out_dir=out_dir)
+                    print(f"eval_on_env: {metrics}")
+                    metrics_history.append(metrics)
+                    if do_wandb:
+                        wandb.log({**{f"env/{k}": v for k, v in metrics.items()}, "epoch": epoch})
+                except Exception as e:
+                    print(f"eval_on_env skipped: {e}")
+            accelerator.wait_for_everyone()
 
         # validation loss + action_diff metrics
         if epoch % cfg.eval_freq == 0:
@@ -218,7 +250,7 @@ def main(cfg):
         # train
         cbet_model.train()
         train_loss = 0.0
-        for batch in train_loader:
+        for batch in tqdm.tqdm(train_loader, disable=not accelerator.is_main_process):
             optimizer.zero_grad()
             _, loss, loss_dict = run_model(batch)
             train_loss += loss.item()
@@ -243,6 +275,29 @@ def main(cfg):
         if epoch % cfg.save_every == 0 and accelerator.is_main_process:
             torch.save(accelerator.unwrap_model(cbet_model), out_dir / f"model_{epoch}.pt")
 
+    # final closed-loop eval + best-metric report (mirrors online_eval.py's tail)
+    if cfg.eval_on_env:
+        if accelerator.is_main_process:
+            try:
+                metrics = eval_on_env(cfg, encoder, accelerator.unwrap_model(cbet_model),
+                                      device, use_diffusion, epoch=cfg.epochs, out_dir=out_dir)
+                print(f"final eval_on_env: {metrics}")
+                metrics_history.append(metrics)
+                if do_wandb:
+                    wandb.log({**{f"env/{k}": v for k, v in metrics.items()}, "epoch": cfg.epochs})
+                # best across all evals, by the primary metric this env exposes
+                for key in ("final_coverage_mean", "success_rate", "avg_reward"):
+                    vals = [m[key] for m in metrics_history if key in m]
+                    if vals:
+                        best = max(vals)
+                        print(f"best {key} over training: {best}")
+                        if do_wandb:
+                            wandb.log({f"best/{key}": best, "epoch": cfg.epochs})
+                        break
+            except Exception as e:
+                print(f"final eval_on_env skipped: {e}")
+        accelerator.wait_for_everyone()
+
     if accelerator.is_main_process:
         torch.save(accelerator.unwrap_model(cbet_model), out_dir / "model_final.pt")
 
@@ -250,9 +305,15 @@ def main(cfg):
 # Closed-loop env eval: roll the policy out per step, report eval_state success
 # plus coverage for envs that expose it (pusht). The sim state comes from
 # info["state"]. Action ensembling follows the standard receding-horizon scheme.
+# When save_eval_video is set, the first eval batch writes per-episode rollout
+# videos (goal frame on the right) to the run directory.
 @torch.no_grad()
-def eval_on_env(cfg, encoder, policy, device, use_diffusion):
+def eval_on_env(cfg, encoder, policy, device, use_diffusion, epoch=0, out_dir=None):
     n_envs = cfg.n_envs
+    save_video = bool(cfg.get("save_eval_video", True))
+    n_videos = int(cfg.get("n_eval_videos", 3))
+    video_fps = int(cfg.get("eval_video_fps", 12))
+    video_dir = Path(out_dir) if out_dir is not None else Path(os.getcwd())
 
     _, traj_dset = hydra.utils.call(
         cfg.env.dataset, num_hist=cfg.num_hist,
@@ -304,7 +365,29 @@ def eval_on_env(cfg, encoder, policy, device, use_diffusion):
             ).to(device)  # (b, C, H, W) in [0,1]
             goal_emb = encoder(goal_imgs).reshape(len(idxs), 1, encoder.n_patches, encoder.emb_dim)
 
+        # record rollout frames only for the first eval batch (keeps disk small)
+        record = save_video and b == 0
+        frames_per_env = [[] for _ in range(n_envs)] if record else None
+        goal_vis = None
+        if record:
+            goal_vis = [_frame_to_uint8(rearrange(
+                dset.get_frames(j, [last[k]])[0]["visual"][0], "c h w -> h w c"))
+                for k, j in enumerate(idxs)]
+
+        def rec(visual_np):
+            if not record:
+                return
+            v = np.asarray(visual_np)
+            for i in range(n_envs):
+                frame = _frame_to_uint8(v[i])
+                # append goal on the right only if heights match (env render size
+                # can differ from the dataset's resized goal frame)
+                if goal_vis is not None and goal_vis[i].shape[0] == frame.shape[0]:
+                    frame = np.concatenate([frame, goal_vis[i]], axis=1)
+                frames_per_env[i].append(frame)
+
         obs, _ = env.prepare(seeds, init_states)
+        rec(obs["visual"])
         obs_stack = deque([embed(obs["visual"])], maxlen=cfg.window_size)
         action_list, last_info, steps, done = [], None, 0, np.array([False])
         # eval_horizon counts TOTAL env steps (dino_wm envs never set done=True),
@@ -319,6 +402,7 @@ def eval_on_env(cfg, encoder, policy, device, use_diffusion):
                 # diffusion returns (b, chunk, A): execute each action in the chunk
                 for t in range(action.shape[1]):
                     obs, rew, done, info = step_env(action[:, t].cpu().numpy())
+                    rec(obs["visual"])
                     obs_stack.append(embed(obs["visual"]))
                     total_reward += float(rew.sum()); last_info = info; steps += 1
                     if np.all(done) or steps >= cfg.eval_horizon:
@@ -335,22 +419,36 @@ def eval_on_env(cfg, encoder, policy, device, use_diffusion):
                 else:
                     curr_action = action[:, -1, 0, :].cpu().numpy()
                 obs, rew, done, info = step_env(curr_action)
+                rec(obs["visual"])
                 obs_stack.append(embed(obs["visual"]))
                 total_reward += float(rew.sum()); last_info = info; steps += 1
 
+        batch_success = None
         if last_info is not None and "final_coverage" in last_info[0]:
             final_cov += [last_info[i]["final_coverage"] for i in range(n_envs)]
             max_cov += [last_info[i]["max_coverage"] for i in range(n_envs)]
         if last_info is not None and "state" in last_info[0]:
             cur_states = np.stack([last_info[i]["state"] for i in range(n_envs)])
             res = env.eval_state(goal_states, cur_states)
-            successes += np.asarray(res["success"]).astype(float).tolist()
+            batch_success = np.asarray(res["success"])
+            successes += batch_success.astype(float).tolist()
             # distance key varies by env: state_dist (pusht/maze/wall),
             # chamfer_distance (deformable); collect whichever is present.
             dist_key = "state_dist" if "state_dist" in res else (
                 "chamfer_distance" if "chamfer_distance" in res else None)
             if dist_key is not None:
                 state_dists += np.asarray(res[dist_key]).astype(float).tolist()
+
+        # write per-episode rollout videos (first batch only)
+        if record:
+            import imageio
+            os.makedirs(video_dir, exist_ok=True)
+            for i in range(min(n_envs, n_videos)):
+                tag = "" if batch_success is None else (
+                    "_success" if batch_success[i] else "_failure")
+                path = video_dir / f"eval_epoch{epoch}_env{i}{tag}.mp4"
+                imageio.mimsave(str(path), frames_per_env[i], fps=video_fps)
+            print(f"saved {min(n_envs, n_videos)} eval videos to {video_dir}")
     env.close()
 
     metrics = {"avg_reward": total_reward / cfg.n_env_evals}
@@ -358,9 +456,13 @@ def eval_on_env(cfg, encoder, policy, device, use_diffusion):
         metrics["success_rate"] = float(np.mean(successes))
     if state_dists:  # distance-to-goal (key varies by env; absent if neither)
         metrics["mean_goal_dist"] = float(np.mean(state_dists))
-    if final_cov:  # coverage (pusht)
+    if final_cov:  # coverage (pusht): mean/max/min, matching online_eval.py
         metrics["final_coverage_mean"] = float(np.mean(final_cov))
+        metrics["final_coverage_max"] = float(np.max(final_cov))
+        metrics["final_coverage_min"] = float(np.min(final_cov))
         metrics["max_coverage_mean"] = float(np.mean(max_cov))
+        metrics["max_coverage_max"] = float(np.max(max_cov))
+        metrics["max_coverage_min"] = float(np.min(max_cov))
         print("final coverage mean:", metrics["final_coverage_mean"])
     return metrics
 

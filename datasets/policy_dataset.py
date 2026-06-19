@@ -307,23 +307,20 @@ class VqbetTrajectorySlicerDataset(TrajectoryDataset):
 
     def __getitem__(self, idx):
         i, start, end = self.slices[idx]
-        obs, act, *others = self.dataset[i]
+        T = self.dataset.get_seq_length(i)
+        # read only the frames this window needs (obs over [start, end), actions
+        # up to end-1+action_window), not the whole trajectory.
+        read_hi = min(end - 1 + self.action_window, T)
+        obs, act, mask = self.dataset.get_frames(i, list(range(start, read_hi)))
+        win = end - start  # obs are indexed from 0 == frame `start`
 
-        if end - start < self.window:
-            obs_win = repeat_start_to_length(obs[start:end], self.window, dim=0)
-            act = repeat_start_to_length(
-                act[start: end - 1 + self.action_window],
-                self.window + self.action_window - 1,
-                dim=0,
-            )
-            repeated_others = [
-                repeat_start_to_length(other[start:end], self.window, dim=0)
-                for other in others
-            ]
+        if win < self.window:
+            obs_win = repeat_start_to_length(obs[:win], self.window, dim=0)
+            act = repeat_start_to_length(act, self.window + self.action_window - 1, dim=0)
+            mask_win = repeat_start_to_length(mask[:win], self.window, dim=0)
         else:
-            obs_win = obs[start:end]
-            act = act[start: end - 1 + self.action_window]
-            repeated_others = [other[start:end] for other in others]
+            obs_win = obs[:win]
+            mask_win = mask[:win]
 
         if self.vqbet_get_future_action_chunk:
             expected_len = self.action_window
@@ -335,12 +332,13 @@ class VqbetTrajectorySlicerDataset(TrajectoryDataset):
             act = repeat_end_to_length(act, expected_len, dim=0)
 
         if self.goal_conditional:
-            # hindsight goal: the trajectory's final-frame embedding, repeated
-            # across the obs window. obs is the full traj (T, V, P, E).
-            goal_win = obs[-1:].repeat(self.window, *([1] * (obs.ndim - 1)))
+            # hindsight goal: the trajectory's final frame, repeated across the
+            # obs window (an embedding if precomputed, else a raw image).
+            goal = self.dataset.get_frames(i, [T - 1])[0]  # (1, ...)
+            goal_win = goal.repeat(self.window, *([1] * (goal.ndim - 1)))
             values = [obs_win, act, goal_win]
         else:
-            values = [obs_win, act, *repeated_others]
+            values = [obs_win, act, mask_win]
         if self.transform is not None:
             values = self.transform(values)
         return tuple(values)
