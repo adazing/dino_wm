@@ -1,5 +1,7 @@
 import cloudpickle
 import ctypes
+import os
+import multiprocessing
 import gym
 import numpy as np
 import numpy as np
@@ -11,6 +13,27 @@ from collections import OrderedDict
 from multiprocessing import Array, Pipe, connection
 from multiprocessing.context import Process
 from typing import Any, Callable, List, Optional, Tuple, Union
+
+# How worker processes are created. On Linux multiprocessing defaults to FORK, which copies the
+# parent process wholesale, including state that is not valid in a copy.
+_VALID_START_METHODS = ("fork", "spawn", "forkserver")
+
+
+def _mp_context(start_method: Optional[str] = None):
+    """multiprocessing context for the worker processes.
+
+    Resolution order: explicit argument -> $DINO_WM_ENV_START_METHOD -> platform default.
+    """
+    sm = start_method or os.environ.get("DINO_WM_ENV_START_METHOD") or None
+    if not sm:
+        return multiprocessing   # platform default (fork on Linux), unchanged behaviour
+    sm = str(sm).lower()
+    if sm not in _VALID_START_METHODS:
+        raise ValueError(f"start_method must be one of {_VALID_START_METHODS}, got {sm!r}")
+    if sm not in multiprocessing.get_all_start_methods():
+        raise ValueError(f"start_method={sm!r} is not available on this platform "
+                         f"(have: {multiprocessing.get_all_start_methods()})")
+    return multiprocessing.get_context(sm)
 
 from utils import aggregate_dct
 
@@ -61,11 +84,8 @@ GYM_RESERVED_KEYS = [
 ]
 
 
-################################################################################
-#
-# Workers
-#
-################################################################################
+# ############################################################################### Workers
+# ###############################################################################
 
 
 class EnvWorker(ABC):
@@ -80,7 +100,7 @@ class EnvWorker(ABC):
             Tuple[np.ndarray, dict],
             np.ndarray,
         ]
-        # self.action_space = self.get_env_attr("action_space")  # noqa: B009
+        # self.action_space = self.get_env_attr("action_space") # noqa: B009
         self.is_reset = False
 
     @abstractmethod
@@ -92,12 +112,7 @@ class EnvWorker(ABC):
         pass
 
     def send(self, action: Optional[np.ndarray]) -> None:
-        """Send action signal to low-level worker.
-
-        When action is None, it indicates sending "reset" signal; otherwise
-        it indicates "step" signal. The paired return value from "recv"
-        function is determined by such kind of different signal.
-        """
+        """Send action signal to low-level worker."""
         if hasattr(self, "send_action"):
             deprecation(
                 "send_action will soon be deprecated. "
@@ -117,14 +132,8 @@ class EnvWorker(ABC):
         gym_new_venv_step_type,
         Tuple[np.ndarray, dict],
         np.ndarray,
-    ]:  # noqa:E125
-        """Receive result from low-level worker.
-
-        If the last "send" function sends a NULL action, it only returns a
-        single observation; otherwise it returns a tuple of (obs, rew, done,
-        info) or (obs, rew, terminated, truncated, info), based on whether
-        the environment is using the old step API or the new one.
-        """
+    ]:   # noqa:E125
+        """Receive result from low-level worker."""
         if hasattr(self, "get_result"):
             deprecation(
                 "get_result will soon be deprecated. "
@@ -141,14 +150,9 @@ class EnvWorker(ABC):
     def step(
         self, action: np.ndarray
     ) -> Union[gym_old_venv_step_type, gym_new_venv_step_type]:
-        """Perform one timestep of the environment's dynamic.
-
-        "send" and "recv" are coupled in sync simulation, so users only call
-        "step" function. But they can be called separately in async
-        simulation, i.e. someone calls "send" first, and calls "recv" later.
-        """
+        """Perform one timestep of the environment's dynamic."""
         self.send(action)
-        return self.recv()  # type: ignore
+        return self.recv()   # type: ignore
 
     @staticmethod
     def wait(
@@ -158,7 +162,7 @@ class EnvWorker(ABC):
         raise NotImplementedError
 
     def seed(self, seed: Optional[int] = None) -> Optional[List[int]]:
-        # return self.action_space.seed(seed)  # issue 299
+        # return self.action_space.seed(seed) # issue 299
         pass
 
     @abstractmethod
@@ -181,7 +185,7 @@ class ShArray:
     """Wrapper of multiprocessing Array."""
 
     def __init__(self, dtype: np.generic, shape: Tuple[int]) -> None:
-        self.arr = Array(_NP_TO_CT[dtype.type], int(np.prod(shape)))  # type: ignore
+        self.arr = Array(_NP_TO_CT[dtype.type], int(np.prod(shape)))   # type: ignore
         self.dtype = dtype
         self.shape = shape
 
@@ -190,12 +194,12 @@ class ShArray:
         dst = self.arr.get_obj()
         dst_np = np.frombuffer(dst, dtype=self.dtype).reshape(
             self.shape
-        )  # type: ignore
+        )   # type: ignore
         np.copyto(dst_np, ndarray)
 
     def get(self) -> np.ndarray:
         obj = self.arr.get_obj()
-        return np.frombuffer(obj, dtype=self.dtype).reshape(self.shape)  # type: ignore
+        return np.frombuffer(obj, dtype=self.dtype).reshape(self.shape)   # type: ignore
 
 
 def _setup_buf(space: gym.Space) -> Union[dict, tuple, ShArray]:
@@ -206,7 +210,7 @@ def _setup_buf(space: gym.Space) -> Union[dict, tuple, ShArray]:
         assert isinstance(space.spaces, tuple)
         return tuple([_setup_buf(t) for t in space.spaces])
     else:
-        return ShArray(space.dtype, space.shape)  # type: ignore
+        return ShArray(space.dtype, space.shape)   # type: ignore
 
 
 def _worker(
@@ -234,7 +238,7 @@ def _worker(
         while True:
             try:
                 cmd, data = p.recv()
-            except EOFError:  # the pipe has been closed
+            except EOFError:   # the pipe has been closed
                 p.close()
                 break
             if cmd == "step":
@@ -294,6 +298,16 @@ def _worker(
                 p.send(env_return)
             elif cmd == "prepare":
                 obs, state_dct = env.prepare(data[0], data[1])
+                # prepare() resets the inner env directly, bypassing gym's wrappers, so
+                # OrderEnforcing/TimeLimit still think reset() was never called and a later
+                # env.step() (closed-loop eval) would assert.
+                _e = env
+                while _e is not None:
+                    if hasattr(_e, "_has_reset"):
+                        _e._has_reset = True
+                    if hasattr(_e, "_elapsed_steps"):
+                        _e._elapsed_steps = 0
+                    _e = getattr(_e, "env", None)
                 if obs_bufs is not None:
                     _encode_obs(obs, obs_bufs)
                     obs = None
@@ -302,7 +316,7 @@ def _worker(
                 state = env.sample_random_init_goal_states(data)
                 p.send(state)
             elif cmd == "eval_state":
-                p.send(env.eval_state(data[0], data[1])) 
+                p.send(env.eval_state(data[0], data[1]))
             elif cmd == "update_env":
                 p.send(env.update_env(data))
             else:
@@ -331,7 +345,7 @@ class DummyEnvWorker(EnvWorker):
         return self.env.reset(**kwargs)
 
     @staticmethod
-    def wait(  # type: ignore
+    def wait(   # type: ignore
         workers: List["DummyEnvWorker"], wait_num: int, timeout: Optional[float] = None
     ) -> List["DummyEnvWorker"]:
         # Sequential EnvWorker objects are always ready
@@ -341,15 +355,15 @@ class DummyEnvWorker(EnvWorker):
         if action is None:
             self.result = self.env.reset(**kwargs)
         else:
-            self.result = self.env.step(action)  # type: ignore
+            self.result = self.env.step(action)   # type: ignore
 
     def seed(self, seed: Optional[int] = None) -> Optional[List[int]]:
         super().seed(seed)
         try:
-            return self.env.seed(seed)  # type: ignore
+            return self.env.seed(seed)   # type: ignore
         except (AttributeError, NotImplementedError):
             self.env.reset(seed=seed)
-            return [seed]  # type: ignore
+            return [seed]   # type: ignore
 
     def render(self, **kwargs: Any) -> Any:
         return self.env.render(**kwargs)
@@ -374,9 +388,13 @@ class SubprocEnvWorker(EnvWorker):
     """Subprocess worker used in SubprocVectorEnv and ShmemVectorEnv."""
 
     def __init__(
-        self, env_fn: Callable[[], gym.Env], share_memory: bool = False
+        self, env_fn: Callable[[], gym.Env], share_memory: bool = False,
+        start_method: Optional[str] = None,
     ) -> None:
-        self.parent_remote, self.child_remote = Pipe()
+        # Pipe and Process must come from the same context, a fork-context Connection cannot be
+        # handed to a spawn-context Process.
+        ctx = _mp_context(start_method)
+        self.parent_remote, self.child_remote = ctx.Pipe()
         self.share_memory = share_memory
         self.buffer: Optional[Union[dict, tuple, ShArray]] = None
         if self.share_memory:
@@ -391,7 +409,7 @@ class SubprocEnvWorker(EnvWorker):
             CloudpickleWrapper(env_fn),
             self.buffer,
         )
-        self.process = Process(target=_worker, args=args, daemon=True)
+        self.process = ctx.Process(target=_worker, args=args, daemon=True)
         self.process.start()
         self.child_remote.close()
         super().__init__(env_fn)
@@ -418,7 +436,7 @@ class SubprocEnvWorker(EnvWorker):
         return decode_obs(self.buffer)
 
     @staticmethod
-    def wait(  # type: ignore
+    def wait(   # type: ignore
         workers: List["SubprocEnvWorker"],
         wait_num: int,
         timeout: Optional[float] = None,
@@ -433,7 +451,7 @@ class SubprocEnvWorker(EnvWorker):
                     break
             # connection.wait hangs if the list is empty
             new_ready_conns = connection.wait(remain_conns, timeout=remain_time)
-            ready_conns.extend(new_ready_conns)  # type: ignore
+            ready_conns.extend(new_ready_conns)   # type: ignore
             remain_conns = [conn for conn in remain_conns if conn not in ready_conns]
         return [workers[conns.index(con)] for con in ready_conns]
 
@@ -444,18 +462,18 @@ class SubprocEnvWorker(EnvWorker):
             self.parent_remote.send(["reset", kwargs])
         else:
             self.parent_remote.send(["step", action])
-    
+
     def rollout(self,seed,init_state,actions):
         self.parent_remote.send(["rollout", (seed, init_state, actions)])
-    
+
     def prepare(self, seed, init_state):
         self.parent_remote.send(["prepare", (seed, init_state)])
         return self.parent_remote.recv()
-    
+
     def sample_random_init_goal_states(self, seed):
         self.parent_remote.send(["sample_random_init_goal_states", seed])
         return self.parent_remote.recv()
-    
+
     def eval_state(self, goal_state, cur_state):
         self.parent_remote.send(["eval_state", (goal_state, cur_state)])
         return self.parent_remote.recv()
@@ -471,7 +489,7 @@ class SubprocEnvWorker(EnvWorker):
         gym_new_venv_step_type,
         Tuple[np.ndarray, dict],
         np.ndarray,
-    ]:  # noqa:E125
+    ]:   # noqa:E125
         result = self.parent_remote.recv()
         if isinstance(result, tuple):
             if len(result) == 2:
@@ -482,7 +500,7 @@ class SubprocEnvWorker(EnvWorker):
             obs = result[0]
             if self.share_memory:
                 obs = self._decode_obs()
-            return (obs, *result[1:])  # type: ignore
+            return (obs, *result[1:])   # type: ignore
         else:
             obs = result
             if self.share_memory:
@@ -547,11 +565,8 @@ class SubprocEnvWorker(EnvWorker):
         return obs
 
 
-################################################################################
-#
-# VecEnvs
-#
-################################################################################
+# ############################################################################### VecEnvs
+# ###############################################################################
 
 
 class BaseVectorEnv(object):
@@ -559,50 +574,13 @@ class BaseVectorEnv(object):
 
     Usage:
     ::
-
-        env_num = 8
-        envs = DummyVectorEnv([lambda: gym.make(task) for _ in range(env_num)])
-        assert len(envs) == env_num
-
-    It accepts a list of environment generators. In other words, an environment
-    generator ``efn`` of a specific task means that ``efn()`` returns the
-    environment of the given task, for example, ``gym.make(task)``.
-
-    All of the VectorEnv must inherit :class:`~tianshou.env.BaseVectorEnv`.
-    Here are some other usages:
-    ::
-
-        envs.seed(2)  # which is equal to the next line
-        envs.seed([2, 3, 4, 5, 6, 7, 8, 9])  # set specific seed for each env
-        obs = envs.reset()  # reset all environments
-        obs = envs.reset([0, 5, 7])  # reset 3 specific environments
-        obs, rew, done, info = envs.step([1] * 8)  # step synchronously
-        envs.render()  # render all environments
-        envs.close()  # close all environments
-
-    .. warning::
-
-        If you use your own environment, please make sure the ``seed`` method
-        is set up properly, e.g.,
-        ::
-
-            def seed(self, seed):
-                np.random.seed(seed)
-
-        Otherwise, the outputs of these envs may be the same with each other.
-
-    :param env_fns: a list of callable envs, ``env_fns[i]()`` generates the i-th env.
-    :param worker_fn: a callable worker, ``worker_fn(env_fns[i])`` generates a
-        worker which contains the i-th env.
-    :param int wait_num: use in asynchronous simulation if the time cost of
-        ``env.step`` varies with time and synchronously waiting for all
-        environments to finish a step is time-wasting. In that case, we can
-        return when ``wait_num`` environments finish a step and keep on
-        simulation in these environments. If ``None``, asynchronous simulation
-        is disabled; else, ``1 <= wait_num <= env_num``.
-    :param float timeout: use in asynchronous simulation same as above, in each
-        vectorized step it only deal with those environments spending time
-        within ``timeout`` seconds.
+    envs.seed(2)   # which is equal to the next line
+    envs.seed([2, 3, 4, 5, 6, 7, 8, 9])   # set specific seed for each env
+    obs = envs.reset()   # reset all environments
+    obs = envs.reset([0, 5, 7])   # reset 3 specific environments
+    obs, rew, done, info = envs.step([1] * 8)   # step synchronously
+    envs.render()   # render all environments
+    envs.close()   # close all environments
     """
 
     def __init__(
@@ -613,8 +591,8 @@ class BaseVectorEnv(object):
         timeout: Optional[float] = None,
     ) -> None:
         self._env_fns = env_fns
-        # A VectorEnv contains a pool of EnvWorkers, which corresponds to
-        # interact with the given envs (one worker <-> one env).
+        # A VectorEnv contains a pool of EnvWorkers, which corresponds to interact with the given
+        # envs, one worker <-> one env.
         self.workers = [worker_fn(fn) for fn in env_fns]
         self.worker_class = type(self.workers[0])
         assert issubclass(self.worker_class, EnvWorker)
@@ -631,10 +609,9 @@ class BaseVectorEnv(object):
         ), f"timeout is {timeout}, it should be positive if provided!"
         self.is_async = self.wait_num != len(env_fns) or timeout is not None
         self.waiting_conn: List[EnvWorker] = []
-        # environments in self.ready_id is actually ready
-        # but environments in self.waiting_id are just waiting when checked,
-        # and they may be ready now, but this is not known until we check it
-        # in the step() function
+        # environments in self.ready_id is actually ready but environments in self.waiting_id are
+        # just waiting when checked and they may be ready now, but this is not known until we
+        # check it in the step() function
         self.waiting_id: List[int] = []
         # all environments are ready in the beginning
         self.ready_id = list(range(self.env_num))
@@ -650,13 +627,8 @@ class BaseVectorEnv(object):
         return self.env_num
 
     def __getattribute__(self, key: str) -> Any:
-        """Switch the attribute getter depending on the key.
-
-        Any class who inherits ``gym.Env`` will inherit some attributes, like
-        ``action_space``. However, we would like the attribute lookup to go straight
-        into the worker (in fact, this vector env's action_space is always None).
-        """
-        if key in GYM_RESERVED_KEYS:  # reserved keys in gym.Env
+        """Switch the attribute getter depending on the key."""
+        if key in GYM_RESERVED_KEYS:   # reserved keys in gym.Env
             return self.get_env_attr(key)
         else:
             return super().__getattribute__(key)
@@ -666,18 +638,7 @@ class BaseVectorEnv(object):
         key: str,
         id: Optional[Union[int, List[int], np.ndarray]] = None,
     ) -> List[Any]:
-        """Get an attribute from the underlying environments.
-
-        If id is an int, retrieve the attribute denoted by key from the environment
-        underlying the worker at index id. The result is returned as a list with one
-        element. Otherwise, retrieve the attribute for all workers at indices id and
-        return a list that is ordered correspondingly to id.
-
-        :param str key: The key of the desired attribute.
-        :param id: Indice(s) of the desired worker(s). Default to None for all env_id.
-
-        :return list: The list of environment attributes.
-        """
+        """Get an attribute from the underlying environments."""
         self._assert_is_not_closed()
         id = self._wrap_id(id)
         if self.is_async:
@@ -691,16 +652,7 @@ class BaseVectorEnv(object):
         value: Any,
         id: Optional[Union[int, List[int], np.ndarray]] = None,
     ) -> None:
-        """Set an attribute in the underlying environments.
-
-        If id is an int, set the attribute denoted by key from the environment
-        underlying the worker at index id to value.
-        Otherwise, set the attribute for all workers at indices id.
-
-        :param str key: The key of the desired attribute.
-        :param Any value: The new value of the attribute.
-        :param id: Indice(s) of the desired worker(s). Default to None for all env_id.
-        """
+        """Set an attribute in the underlying environments."""
         self._assert_is_not_closed()
         id = self._wrap_id(id)
         if self.is_async:
@@ -714,7 +666,7 @@ class BaseVectorEnv(object):
     ) -> Union[List[int], np.ndarray]:
         if id is None:
             return list(range(self.env_num))
-        return [id] if np.isscalar(id) else id  # type: ignore
+        return [id] if np.isscalar(id) else id   # type: ignore
 
     def _assert_id(self, id: Union[List[int], np.ndarray]) -> None:
         for i in id:
@@ -730,12 +682,7 @@ class BaseVectorEnv(object):
         id: Optional[Union[int, List[int], np.ndarray]] = None,
         **kwargs: Any,
     ) -> Union[np.ndarray, Tuple[np.ndarray, Union[dict, List[dict]]]]:
-        """Reset the state of some envs and return initial observations.
-
-        If id is None, reset the state of all the environments and return
-        initial observations, otherwise reset the specific environments with
-        the given id, either an int or a list.
-        """
+        """Reset the state of some envs and return initial observations."""
         self._assert_is_not_closed()
         id = self._wrap_id(id)
         if self.is_async:
@@ -763,12 +710,12 @@ class BaseVectorEnv(object):
             )
         try:
             obs = np.stack(obs_list)
-        except ValueError:  # different len(obs)
+        except ValueError:   # different len(obs)
             obs = np.array(obs_list, dtype=object)
 
         if reset_returns_info:
             infos = [r[1] for r in ret_list]
-            return obs, infos  # type: ignore
+            return obs, infos   # type: ignore
         else:
             return obs
 
@@ -779,47 +726,7 @@ class BaseVectorEnv(object):
     ) -> Union[gym_old_venv_step_type, gym_new_venv_step_type]:
         """Run one timestep of some environments' dynamics.
 
-        If id is None, run one timestep of all the environments’ dynamics;
-        otherwise run one timestep for some environments with given id,  either
-        an int or a list. When the end of episode is reached, you are
-        responsible for calling reset(id) to reset this environment’s state.
-
-        Accept a batch of action and return a tuple (batch_obs, batch_rew,
-        batch_done, batch_info) in numpy format.
-
-        :param numpy.ndarray action: a batch of action provided by the agent.
-
-        :return: A tuple consisting of either:
-
-            * ``obs`` a numpy.ndarray, the agent's observation of current environments
-            * ``rew`` a numpy.ndarray, the amount of rewards returned after \
-                previous actions
-            * ``done`` a numpy.ndarray, whether these episodes have ended, in \
-                which case further step() calls will return undefined results
-            * ``info`` a numpy.ndarray, contains auxiliary diagnostic \
-                information (helpful for debugging, and sometimes learning)
-
-            or:
-
-            * ``obs`` a numpy.ndarray, the agent's observation of current environments
-            * ``rew`` a numpy.ndarray, the amount of rewards returned after \
-                previous actions
-            * ``terminated`` a numpy.ndarray, whether these episodes have been \
-                terminated
-            * ``truncated`` a numpy.ndarray, whether these episodes have been truncated
-            * ``info`` a numpy.ndarray, contains auxiliary diagnostic \
-                information (helpful for debugging, and sometimes learning)
-
-            The case distinction is made based on whether the underlying environment
-            uses the old step API (first case) or the new step API (second case).
-
-        For the async simulation:
-
-        Provide the given action to the environments. The action sequence
-        should correspond to the ``id`` argument, and the ``id`` argument
-        should be a subset of the ``env_id`` in the last returned ``info``
-        (initially they are env_ids of all the environments). If action is
-        None, fetch unfinished step() calls instead.
+        If id is None, run one timestep of all the environments’ dynamics, otherwise run one timestep for some environments with given id,  either
         """
         self._assert_is_not_closed()
         id = self._wrap_id(id)
@@ -851,26 +758,26 @@ class BaseVectorEnv(object):
                 waiting_index = self.waiting_conn.index(conn)
                 self.waiting_conn.pop(waiting_index)
                 env_id = self.waiting_id.pop(waiting_index)
-                # env_return can be (obs, reward, done, info) or
-                # (obs, reward, terminated, truncated, info)
+                # env_return can be, obs, reward, done, info or, obs, reward, terminated,
+                # truncated, info
                 env_return = conn.recv()
-                env_return[-1]["env_id"] = env_id  # Add `env_id` to info
+                env_return[-1]["env_id"] = env_id   # Add `env_id` to info
                 result.append(env_return)
                 self.ready_id.append(env_id)
         return_lists = tuple(zip(*result))
         obs_list = return_lists[0]
         if isinstance(obs_list[0], dict):
-            # dict observations (dino_wm envs): merge like rollout() does instead
-            # of np.stack, so step() supports closed-loop dict-obs envs.
+            # dict observations (dino_wm envs), merge like rollout() does instead of np.stack, so
+            # step() supports closed-loop dict-obs envs.
             obs_stack = aggregate_dct(list(obs_list))
         else:
             try:
                 obs_stack = np.stack(obs_list)
-            except ValueError:  # different len(obs)
+            except ValueError:   # different len(obs)
                 obs_stack = np.array(obs_list, dtype=object)
         other_stacks = map(np.stack, return_lists[1:])
-        return (obs_stack, *other_stacks)  # type: ignore
-    
+        return (obs_stack, *other_stacks)   # type: ignore
+
     def rollout(self,seeds,init_states,action: np.ndarray,id: Optional[Union[int, List[int], np.ndarray]] = None):
         self._assert_is_not_closed()
         id = self._wrap_id(id)
@@ -888,7 +795,7 @@ class BaseVectorEnv(object):
         obses = aggregate_dct(obses)
         states = np.stack(states)
         return obses, states
-    
+
     def prepare(self, seeds, init_states):
         self._assert_is_not_closed()
         obs_list = []
@@ -905,7 +812,7 @@ class BaseVectorEnv(object):
         self._assert_is_not_closed()
         init_state, goal_state = zip(*(self.workers[i].sample_random_init_goal_states(seed[i]) for i in range(self.env_num)))
         return np.stack(init_state), np.stack(goal_state)
-    
+
     def eval_state(self, goal_state, cur_state):
         self._assert_is_not_closed()
         eval_result = []
@@ -919,21 +826,13 @@ class BaseVectorEnv(object):
         self._assert_is_not_closed()
         for i in range(self.env_num):
             self.workers[i].update_env(env_info[i])
-        
-        
+
+
     def seed(
         self,
         seed: Optional[Union[int, List[int]]] = None,
     ) -> List[Optional[List[int]]]:
-        """Set the seed for all environments.
-
-        Accept ``None``, an int (which will extend ``i`` to
-        ``[i, i + 1, i + 2, ...]``) or a list.
-
-        :return: The list of seeds used in this env's random number generators.
-            The first value in the list should be the "main" seed, or the value
-            which a reproducer pass to "seed".
-        """
+        """Set the seed for all environments."""
         self._assert_is_not_closed()
         seed_list: Union[List[None], List[int]]
         if seed is None:
@@ -955,11 +854,7 @@ class BaseVectorEnv(object):
         return [w.render(**kwargs) for w in self.workers]
 
     def close(self) -> None:
-        """Close all of the environments.
-
-        This function will be called only once (if not, it will be called during
-        garbage collected). This way, ``close`` of all workers can be assured.
-        """
+        """Close all of the environments."""
         self._assert_is_not_closed()
         for w in self.workers:
             w.close()
@@ -967,12 +862,7 @@ class BaseVectorEnv(object):
 
 
 class DummyVectorEnv(BaseVectorEnv):
-    """Dummy vectorized environment wrapper, implemented in for-loop.
-
-    .. seealso::
-
-        Please refer to :class:`~tianshou.env.BaseVectorEnv` for other APIs' usage.
-    """
+    """Dummy vectorized environment wrapper, implemented in for-loop."""
 
     def __init__(self, env_fns: List[Callable[[], gym.Env]], **kwargs: Any) -> None:
         super().__init__(env_fns, DummyEnvWorker, **kwargs)
@@ -1015,16 +905,13 @@ class DummyVectorEnv(BaseVectorEnv):
 
 
 class SubprocVectorEnv(BaseVectorEnv):
-    """Vectorized environment wrapper based on subprocess.
+    """Vectorized environment wrapper based on subprocess."""
 
-    .. seealso::
-
-        Please refer to :class:`~tianshou.env.BaseVectorEnv` for other APIs' usage.
-    """
-
-    def __init__(self, env_fns: List[Callable[[], gym.Env]], **kwargs: Any) -> None:
+    def __init__(self, env_fns: List[Callable[[], gym.Env]],
+                 start_method: Optional[str] = None, **kwargs: Any) -> None:
+        # start_method, 'fork' (default) | 'spawn' | 'forkserver'.
         def worker_fn(fn: Callable[[], gym.Env]) -> SubprocEnvWorker:
-            return SubprocEnvWorker(fn, share_memory=False)
+            return SubprocEnvWorker(fn, share_memory=False, start_method=start_method)
 
         super().__init__(env_fns, worker_fn, **kwargs)
 

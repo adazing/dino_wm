@@ -23,7 +23,7 @@ class BasePlanner(ABC):
 
         self.evaluator = evaluator
         self.wandb_run = wandb_run
-        self.log_filename = log_filename  # do not log if None
+        self.log_filename = log_filename   # do not log if None
 
     def dump_logs(self, logs):
         logs_entry = {

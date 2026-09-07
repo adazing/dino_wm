@@ -14,14 +14,14 @@ def check_vertical_wall_intersect(pos1, pos2, wall_x, hole_y, door_space):
         b = pos1[1] - a * pos1[0]
         # y is the intersection point of the wall plane
         y = a * wall_x + b
-        # If the intersection point is in the hole, we are good
-        # otherwise, we need to move the point back
+        # If the intersection point is in the hole, we are good otherwise, we need to move the
+        # point back
         if (
             hole_y is None or y < hole_y - door_space or y > hole_y + door_space
-        ):  # we're not in the hole
-            return torch.tensor([wall_x, y]).to(pos1.device)  # we intersect
+        ):   # we're not in the hole
+            return torch.tensor([wall_x, y]).to(pos1.device)   # we intersect
         else:
-            return None  # we are in the hole and we overlap
+            return None   # we are in the hole and we overlap
     return None
 
 
@@ -36,10 +36,10 @@ def check_horizontal_wall_intersect(pos1, pos2, wall_y, hole_x, door_space):
         x = (wall_y - b) / a
         if (
             hole_x is None or x < hole_x - door_space or x > hole_x + door_space
-        ):  # we're not in the hole
-            return torch.tensor([x, wall_y]).to(pos1.device)  # we intersect
+        ):   # we're not in the hole
+            return torch.tensor([x, wall_y]).to(pos1.device)   # we intersect
         else:
-            return None  # we are in the hole and we overlap
+            return None   # we are in the hole and we overlap
     return None
 
 
@@ -88,8 +88,7 @@ def check_wall_intersect(
             and left_wall_corner <= intersect[0]
             and intersect[0] <= right_wall_corner
         ):
-            # add downward noise and return early
-            # noise = torch.randn(2, device=pos1.device) * 0.5
+            # add downward noise and return early noise = torch.randn(2, device=pos1.device) * 0.5
             noise = torch.ones(2, device=pos1.device) * 0.5
             noise[1] = noise[1].abs() * -1
             return intersect, intersect + noise
@@ -106,8 +105,7 @@ def check_wall_intersect(
             and left_wall_corner <= intersect[0]
             and intersect[0] <= right_wall_corner
         ):
-            # add upward noise and return early
-            # noise = torch.randn(2, device=pos1.device) * 0.5
+            # add upward noise and return early noise = torch.randn(2, device=pos1.device) * 0.5
             noise = torch.ones(2, device=pos1.device) * 0.5
             noise[1] = noise[1].abs()
             return intersect, intersect + noise

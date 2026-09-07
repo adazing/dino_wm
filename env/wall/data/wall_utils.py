@@ -5,10 +5,10 @@ from scipy.stats import truncnorm
 import numpy as np
 
 def normalize_images(img):
-    if img.dim() == 2: 
+    if img.dim() == 2:
         max_val = torch.max(img)
         return img / max_val
-    elif img.dim() == 5: 
+    elif img.dim() == 5:
         bs, T, _, H, W = img.shape
         normalized_img = torch.zeros_like(img)
         for b in range(bs):
@@ -19,7 +19,7 @@ def normalize_images(img):
         return normalized_img
     else:
         raise ValueError("Unsupported input shape. Expected either (h, w) or (bs, T, 1, h, w).")
-    
+
 def generate_wall_layouts(wall_config):
     """
     Generate possible layouts for train and validation
@@ -132,7 +132,6 @@ def sample_uniformly_between(a, b):
     Args:
     - a (torch.Tensor): Input tensor of shape (bs).
     - b (torch.Tensor): Input tensor of shape (bs), where each element is guaranteed to be bigger than a[i].
-
     Returns:
     - c (torch.Tensor): Output tensor of the same shape as a and b, with elements sampled uniformly.
     """

@@ -14,7 +14,7 @@ from utils import (
 from torchvision import utils
 
 
-class PlanEvaluator:  # evaluator for planning
+class PlanEvaluator:   # evaluator for planning
     def __init__(
         self,
         obs_0,
@@ -40,7 +40,7 @@ class PlanEvaluator:  # evaluator for planning
         self.n_plot_samples = n_plot_samples
         self.device = next(wm.parameters()).device
 
-        self.plot_full = False  # plot all frames or frames after frameskip
+        self.plot_full = False   # plot all frames or frames after frameskip
 
     def assign_init_cond(self, obs_0, state_0):
         self.obs_0 = obs_0
@@ -77,19 +77,22 @@ class PlanEvaluator:  # evaluator for planning
         Zero out everything after specified indices for each trajectory in the tensor.
         data: tensor
         """
-        result = data.clone()  # Clone to preserve the original tensor
+        result = data.clone()   # Clone to preserve the original tensor
         for i in range(data.shape[0]):
             if length[i] != np.inf:
                 result[i, int(length[i]) :] = 0
         return result
 
     def eval_actions(
-        self, actions, action_len=None, filename="output", save_video=False
+        self, actions, action_len=None, filename="output", save_video=False, save_plot=True,
+        return_imagined=False,
     ):
         """
         actions: detached torch tensors on cuda
         Returns
             metrics, and feedback from env
+            (return_imagined=True also returns i_final_z_obs: the WM's IMAGINED final latent per
+             trajectory, so a caller can probe "where the WM thinks it ended" vs the real e_states).
         """
         n_evals = actions.shape[0]
         if action_len is None:
@@ -118,7 +121,7 @@ class PlanEvaluator:  # evaluator for planning
         e_final_obs = self._get_trajdict_last(e_obses, action_len * self.frameskip + 1)
         e_final_state = self._get_traj_last(e_states, action_len * self.frameskip + 1)[
             :, 0
-        ]  # reduce dim back
+        ]   # reduce dim back
 
         # compute eval metrics
         logs, successes = self._compute_rollout_metrics(
@@ -127,12 +130,12 @@ class PlanEvaluator:  # evaluator for planning
             i_z_obs=i_final_z_obs,
         )
 
-        # plot trajs
-        if self.wm.decoder is not None:
+        # plot trajs, decoding is only needed if we actually save a figure/video
+        if self.wm.decoder is not None and (save_video or save_plot):
             i_visuals = self.wm.decode_obs(i_z_obses)[0]["visual"]
             i_visuals = self._mask_traj(
                 i_visuals, action_len + 1
-            )  # we have action_len + 1 states
+            )   # we have action_len + 1 states
             e_visuals = self.preprocessor.transform_obs_visual(e_visuals)
             e_visuals = self._mask_traj(e_visuals, action_len * self.frameskip + 1)
             self._plot_rollout_compare(
@@ -140,9 +143,12 @@ class PlanEvaluator:  # evaluator for planning
                 i_visuals=i_visuals,
                 successes=successes,
                 save_video=save_video,
+                save_plot=save_plot,
                 filename=filename,
             )
 
+        if return_imagined:
+            return logs, successes, e_obses, e_states, i_final_z_obs
         return logs, successes, e_obses, e_states
 
     def _compute_rollout_metrics(self, e_state, e_obs, i_z_obs):
@@ -186,7 +192,7 @@ class PlanEvaluator:  # evaluator for planning
         return logs, successes
 
     def _plot_rollout_compare(
-        self, e_visuals, i_visuals, successes, save_video=False, filename=""
+        self, e_visuals, i_visuals, successes, save_video=False, save_plot=True, filename=""
     ):
         """
         i_visuals may have less frames than e_visuals due to frameskip, so pad accordingly
@@ -203,11 +209,11 @@ class PlanEvaluator:  # evaluator for planning
         i_visuals = torch.cat(
             [i_visuals] + [i_visuals] * (self.frameskip - 1),
             dim=2,
-        )  # pad i_visuals (due to frameskip)
+        )   # pad i_visuals (due to frameskip)
         i_visuals = rearrange(i_visuals, "b t n c h w -> b (t n) c h w")
         i_visuals = i_visuals[:, : i_visuals.shape[1] - (self.frameskip - 1)]
 
-        correction = 0.3  # to distinguish env visuals and imagined visuals
+        correction = 0.3   # to distinguish env visuals and imagined visuals
 
         if save_video:
             for idx in range(e_visuals.shape[0]):
@@ -238,6 +244,9 @@ class PlanEvaluator:  # evaluator for planning
                     )
                 video_writer.close()
 
+        if not save_plot:
+            return
+
         # pad i_visuals or subsample e_visuals
         if not self.plot_full:
             e_visuals = e_visuals[:, :: self.frameskip]
@@ -263,7 +272,7 @@ class PlanEvaluator:  # evaluator for planning
         utils.save_image(
             imgs_for_plotting,
             f"{filename}.png",
-            nrow=n_columns,  # nrow is the number of columns
+            nrow=n_columns,   # nrow is the number of columns
             normalize=True,
             value_range=(-1, 1),
         )

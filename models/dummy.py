@@ -7,7 +7,7 @@ class DummyModel(nn.Module):
         self.name = "dummy"
         self.latent_ndim = 1
         self.emb_dim = emb_dim
-        self.fc = nn.Linear(emb_dim, 1)  # not used
+        self.fc = nn.Linear(emb_dim, 1)   # not used
 
     def forward(self, x):
         b, dim = x.shape
@@ -15,7 +15,7 @@ class DummyModel(nn.Module):
         processed_x = torch.zeros([b, self.emb_dim]).to(x.device)
         x_repeated = x.repeat(1, num_repeat)
         processed_x[:, :num_repeat * dim] = x_repeated
-        return x.unsqueeze(1)  # return shape: (b, 1(or # patches), num_features)
+        return x.unsqueeze(1)   # return shape, (b, 1(or # patches), num_features)
 
 class DummyRepeatActionEncoder(nn.Module):
     def __init__(self, in_chans, emb_dim, **kwargs):
@@ -24,7 +24,7 @@ class DummyRepeatActionEncoder(nn.Module):
         self.latent_ndim = 1
         self.in_chans = in_chans
         self.emb_dim = emb_dim
-        self.fc = nn.Linear(in_chans, 1)  # not used
+        self.fc = nn.Linear(in_chans, 1)   # not used
 
     def forward(self, act):
         '''

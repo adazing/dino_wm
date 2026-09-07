@@ -27,24 +27,44 @@ class PushTDataset(TrajDataset):
         normalize_action: bool = True,
         relative=True,
         action_scale=100.0,
-        with_velocity: bool = True, # agent's velocity
-    ):  
+        with_velocity: bool = True,   # agent's velocity
+        split: Optional[str] = None,   # None | "train" | "val", split a single dir by episode
+        split_ratio: float = 0.9,   # fraction of episodes for train when split is set
+    ):
         self.data_path = Path(data_path)
         self.transform = transform
         self.relative = relative
+        self.action_scale = action_scale
         self.normalize_action = normalize_action
         self.states = torch.load(self.data_path / "states.pth")
         self.states = self.states.float()
+
+        # Actions. dino_wm's env is relative (target = agent_pos + action*scale), so `relative`
+        # actions are the native space.
+        rel_path = self.data_path / "rel_actions.pth"
+        abs_path = self.data_path / "abs_actions.pth"
         if relative:
-            self.actions = torch.load(self.data_path / "rel_actions.pth")
+            if rel_path.exists():
+                self.actions = torch.load(rel_path).float()
+            else:
+                abs_actions = torch.load(abs_path).float()
+                self.actions = abs_actions - self.states[..., :2]   # (..., 2) agent pos
         else:
-            self.actions = torch.load(self.data_path / "abs_actions.pth")
-        self.actions = self.actions.float()
-        self.actions = self.actions / action_scale  # scaled back up in env
+            self.actions = torch.load(abs_path).float()
+        self.actions = self.actions / action_scale   # scaled back up in env
+
+        # obses are either per-episode .mp4 (dino_wm) or .pth THWC tensors (patch_policy)
+        obs_dir = self.data_path / "obses"
+        if (obs_dir / "episode_000.pth").exists():
+            self.obs_format = "pth"
+        elif (obs_dir / "episode_000.mp4").exists():
+            self.obs_format = "mp4"
+        else:
+            raise FileNotFoundError(f"No episode_000.pth or .mp4 obs files under {obs_dir}")
 
         with open(self.data_path / "seq_lengths.pkl", "rb") as f:
             self.seq_lengths = pickle.load(f)
-        
+
         # load shapes, assume all shapes are 'T' if file not found
         shapes_file = self.data_path / "shapes.pkl"
         if shapes_file.exists():
@@ -54,24 +74,37 @@ class PushTDataset(TrajDataset):
         else:
             self.shapes = ['T'] * len(self.states)
 
-        self.n_rollout = n_rollout
-        if self.n_rollout:
-            n = self.n_rollout
+        # pick which disk episodes belong to this split.
+        total = len(self.states)
+        if split in ("train", "val"):
+            n_train = int(total * split_ratio)
+            ids = list(range(0, n_train)) if split == "train" else list(range(n_train, total))
         else:
-            n = len(self.states)
+            ids = list(range(total))
+        self.n_rollout = n_rollout
+        if n_rollout:
+            ids = ids[:n_rollout]
+        self.episode_ids = ids
+        n = len(ids)
 
-        self.states = self.states[:n]
-        self.actions = self.actions[:n]
-        self.seq_lengths = self.seq_lengths[:n]
-        self.proprios = self.states[..., :2].clone()  # For pusht, first 2 dim of states is proprio
+        self.states = self.states[ids]
+        self.actions = self.actions[ids]
+        self.seq_lengths = [self.seq_lengths[i] for i in ids]
+        self.shapes = [self.shapes[i] for i in ids]
+        self.proprios = self.states[..., :2].clone()   # For pusht, first 2 dim of states is proprio
         # load velocities and update states and proprios
         self.with_velocity = with_velocity
         if with_velocity:
-            self.velocities = torch.load(self.data_path / "velocities.pth")
-            self.velocities = self.velocities[:n].float()
+            vel_path = self.data_path / "velocities.pth"
+            if vel_path.exists():
+                self.velocities = torch.load(vel_path)[ids].float()
+            else:
+                # patch_policy dumps have no velocities, approximate agent velocity by
+                # finite-differencing agent position at control_hz=10 (env's fps).
+                self.velocities = self._finite_diff_velocity(self.states[..., :2])
             self.states = torch.cat([self.states, self.velocities], dim=-1)
             self.proprios = torch.cat([self.proprios, self.velocities], dim=-1)
-        print(f"Loaded {n} rollouts")
+        print(f"Loaded {n} rollouts (obs={self.obs_format}, split={split})")
 
         self.action_dim = self.actions.shape[-1]
         self.state_dim = self.states.shape[-1]
@@ -95,6 +128,13 @@ class PushTDataset(TrajDataset):
         self.actions = (self.actions - self.action_mean) / self.action_std
         self.proprios = (self.proprios - self.proprio_mean) / self.proprio_std
 
+    @staticmethod
+    def _finite_diff_velocity(pos, control_hz=10.0):
+        # pos, (n, T, 2) -> velocity (n, T, 2), v[t] = (pos[t]-pos[t-1])*control_hz, v[0]=0
+        vel = torch.zeros_like(pos)
+        vel[:, 1:] = (pos[:, 1:] - pos[:, :-1]) * control_hz
+        return vel
+
     def get_seq_length(self, idx):
         return self.seq_lengths[idx]
 
@@ -105,17 +145,26 @@ class PushTDataset(TrajDataset):
             result.append(self.actions[i, :T, :])
         return torch.cat(result, dim=0)
 
+    def _read_obs(self, idx, frames):
+        obs_dir = self.data_path / "obses"
+        ep_id = self.episode_ids[idx]   # local index -> on-disk episode id
+        if self.obs_format == "mp4":
+            reader = VideoReader(str(obs_dir / f"episode_{ep_id:03d}.mp4"), num_threads=1)
+            image = reader.get_batch(frames)   # THWC
+        else:   # patch_policy, per-episode THWC uint8 tensor
+            episode = torch.load(str(obs_dir / f"episode_{ep_id:03d}.pth"))
+            image = episode[frames]   # THWC
+        image = image.float() / 255.0
+        return rearrange(image, "T H W C -> T C H W")
+
     def get_frames(self, idx, frames):
-        vid_dir = self.data_path / "obses"
-        reader = VideoReader(str(vid_dir / f"episode_{idx:03d}.mp4"), num_threads=1)
+        frames = list(frames)
         act = self.actions[idx, frames]
         state = self.states[idx, frames]
         proprio = self.proprios[idx, frames]
         shape = self.shapes[idx]
 
-        image = reader.get_batch(frames)  # THWC
-        image = image / 255.0
-        image = rearrange(image, "T H W C -> T C H W")
+        image = self._read_obs(idx, frames)
         if self.transform:
             image = self.transform(image)
         obs = {"visual": image, "proprio": proprio}
@@ -144,21 +193,38 @@ def load_pusht_slice_train_val(
     num_pred=0,
     frameskip=0,
     with_velocity=True,
+    relative=True,
+    action_scale=100.0,
 ):
-    train_dset = PushTDataset(
-        n_rollout=n_rollout,
-        transform=transform,
-        data_path=data_path + "/train",
-        normalize_action=normalize_action,
-        with_velocity=with_velocity,
-    )
-    val_dset = PushTDataset(
-        n_rollout=n_rollout,
-        transform=transform,
-        data_path=data_path + "/val",
-        normalize_action=normalize_action,
-        with_velocity=with_velocity,
-    )
+    # relative / action_scale forwarded to PushTDataset so a config can be explicit about the
+    # action representation.
+    base = Path(data_path)
+    if (base / "train").exists() and (base / "val").exists():
+        # dino_wm layout, separate train/ and val/ directories
+        train_dset = PushTDataset(
+            n_rollout=n_rollout, transform=transform, data_path=str(base / "train"),
+            normalize_action=normalize_action, with_velocity=with_velocity,
+            relative=relative, action_scale=action_scale,
+        )
+        val_dset = PushTDataset(
+            n_rollout=n_rollout, transform=transform, data_path=str(base / "val"),
+            normalize_action=normalize_action, with_velocity=with_velocity,
+            relative=relative, action_scale=action_scale,
+        )
+    else:
+        # single directory (e.g.
+        train_dset = PushTDataset(
+            n_rollout=n_rollout, transform=transform, data_path=str(base),
+            normalize_action=normalize_action, with_velocity=with_velocity,
+            relative=relative, action_scale=action_scale,
+            split="train", split_ratio=split_ratio,
+        )
+        val_dset = PushTDataset(
+            n_rollout=n_rollout, transform=transform, data_path=str(base),
+            normalize_action=normalize_action, with_velocity=with_velocity,
+            relative=relative, action_scale=action_scale,
+            split="val", split_ratio=split_ratio,
+        )
 
     num_frames = num_hist + num_pred
     train_slices = TrajSlicerDataset(train_dset, num_frames, frameskip)

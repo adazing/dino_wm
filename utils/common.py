@@ -10,11 +10,11 @@ import psutil
 
 def get_ram_usage():
     process = psutil.Process(os.getpid())
-    return process.memory_info().rss / (1024 * 1024 * 1024)  # Memory usage in MB
+    return process.memory_info().rss / (1024 * 1024 * 1024)   # Memory usage in MB
 
 def get_available_ram():
     mem = psutil.virtual_memory()
-    return mem.available / (1024 * 1024 * 1024)  # Available memory in MB
+    return mem.available / (1024 * 1024 * 1024)   # Available memory in MB
 
 def dict_to_namespace(cfg_dict):
     args = argparse.Namespace()

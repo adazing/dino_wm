@@ -27,11 +27,11 @@ class DeformDataset(TrajDataset):
         self.normalize_action = normalize_action
         self.states = torch.load(
             self.data_path / "states.pth"
-        ).float()  # (n_rollout, n_timestep, n_particles, 4)
+        ).float()   # , n_rollout, n_timestep, n_particles, 4
         self.states = rearrange(self.states, "N T P D -> N T (P D)")
 
         self.actions = torch.load(self.data_path / "actions.pth").float()
-        self.actions = self.actions / action_scale  # scaled back up in env
+        self.actions = self.actions / action_scale   # scaled back up in env
 
         self.n_rollout = n_rollout
         if self.n_rollout:
@@ -48,10 +48,10 @@ class DeformDataset(TrajDataset):
 
         self.proprios = torch.zeros(
             (self.states.shape[0], self.states.shape[1], 1)
-        )  # dummy proprio
+        )   # dummy proprio
         self.proprio_dim = self.proprios.shape[-1]
 
-        if normalize_action: 
+        if normalize_action:
             self.action_mean, self.action_std = self.get_data_mean_std(
                 self.actions, self.seq_lengths
             )
@@ -101,12 +101,15 @@ class DeformDataset(TrajDataset):
         act = self.actions[idx, frames]
         state = self.states[idx, frames]
 
-        image = image[frames]  # THWC
-        image = rearrange(image, "T H W C -> T C H W") / 255.0
+        image = image[frames]   # THWC
+        # .float() before the divide (see point_maze_dset), without it the stored dtype is kept so
+        # a float64 episode reaches DINO as double and its patch-embed conv raises "Input type
+        # (double) and bias type (float) should be the same".
+        image = rearrange(image.float(), "T H W C -> T C H W") / 255.0
         if self.transform:
             image = self.transform(image)
         obs = {"visual": image, "proprio": proprio}
-        return obs, act, state, {} # infos is None
+        return obs, act, state, {}   # infos is None
 
     def __getitem__(self, idx):
         return self.get_frames(idx, range(self.get_seq_length(idx)))

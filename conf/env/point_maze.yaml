@@ -1,21 +1,26 @@
+# d4rl maze2d U-maze, a force-controlled point mass in a fixed U-shaped corridor.
+#   #####  passable region in world coords, two vertical arms at x in [0.5,1.1] and
+#   #GOO#  [2.5,3.1] spanning all y, joined by a horizontal connector at y in [2.5,3.1].
+#   ###O#  maze is FIXED (one layout), so update_env is a no-op, unlike wall, which
+#   #OOO#  carries a per-trajectory door/wall location.
 name: point_maze
 args: []
-kwargs: {}
+# maze_name picks the layout from MAZE_SPECS in env/pointmaze/point_maze_wrapper.py. Without it
+# the gym registration's default U_MAZE is used, which does not match a world model trained on
+# medium-maze data.
+#   u | u_eval | small | medium | medium_eval | large | large_eval | open
+kwargs: {maze_name: medium}
 
 # action / goal / view dims for the BC policy
 act_dim: 2
 goal_dim: 0
 views: 1
+# No coverage metric, success is a position threshold, so a 'task' eval pass would degenerate into
+# a goal pass.
+has_coverage: false
 
-dataset:
-  _target_: "datasets.point_maze_dset.load_point_maze_slice_train_val"
-  n_rollout: null
-  normalize_action: ${normalize_action}
-  data_path: ${oc.env:DATASET_DIR}/point_maze
-  split_ratio: 0.9
-  transform:
-    _target_: "datasets.img_transforms.default_transform"
-    img_size: ${img_size}
+# DATASET chosen via the `dataset` group, use dataset=point_maze with this env.
+dataset: ${dataset}
 
 decoder_path: null
 num_workers: 16

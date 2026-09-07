@@ -113,7 +113,7 @@ class DataclassArgParser(argparse.ArgumentParser):
         Parse command-line args into instances of the specified dataclass
         types.  This relies on argparse's `ArgumentParser.parse_known_args`.
         See the doc at:
-        docs.python.org/3.7/library/argparse.html#argparse.ArgumentParser.parse_args
+        docs.python.org/3.7/library/argparse.html   # argparse.ArgumentParser.parse_args
         Args:
             args:
                 List of strings to parse. The default is taken from sys.argv.

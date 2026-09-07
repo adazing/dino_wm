@@ -14,7 +14,7 @@ n_layer: 8
 n_head: 8
 n_embd: 512
 vqvae_batch_size: 1024
-act_scale: 500
+act_scale: 1
 obs_window_size: ${window_size}
 act_window_size: ${action_window_size}
 offset_loss_multiplier: 10

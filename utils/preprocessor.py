@@ -2,7 +2,7 @@ import torch
 from einops import rearrange
 
 class Preprocessor:
-    def __init__(self, 
+    def __init__(self,
         action_mean,
         action_std,
         state_mean,
@@ -21,16 +21,16 @@ class Preprocessor:
 
     def normalize_actions(self, actions):
         '''
-        actions: (b, t, action_dim)  
+        actions: (b, t, action_dim)
         '''
         return (actions - self.action_mean) / self.action_std
 
     def denormalize_actions(self, actions):
         '''
-        actions: (b, t, action_dim)  
+        actions: (b, t, action_dim)
         '''
         return actions * self.action_std + self.action_mean
-    
+
     def normalize_proprios(self, proprio):
         '''
         input shape (..., proprio_dim)
@@ -51,12 +51,19 @@ class Preprocessor:
         transformed_obs_visual = self.preprocess_obs_visual(transformed_obs_visual)
         transformed_obs_visual = self.transform(transformed_obs_visual)
         return transformed_obs_visual
-    
+
     def transform_obs(self, obs):
         '''
         np arrays to tensors
         '''
         transformed_obs = {}
         transformed_obs['visual'] = self.transform_obs_visual(obs['visual'])
-        transformed_obs['proprio'] = self.normalize_proprios(torch.tensor(obs['proprio']))
+        # .float() before normalising. Envs are free to hand back float64 proprio, puzzle's
+        # _proprio explicitly does .astype(np.float64) to keep MuJoCo's native precision, and in
+        # torch `float64 - float32` stays float64, so the tensor arrives at the WM's Conv1d
+        # proprio encoder as a double while its weights are float32, RuntimeError, Input type
+        # (double) and bias type (float) should be the same Same class of fix as the .float()
+        # before /255 in the dataset loaders.
+        transformed_obs['proprio'] = self.normalize_proprios(
+            torch.as_tensor(obs['proprio']).float())
         return transformed_obs

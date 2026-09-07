@@ -1,17 +1,23 @@
 defaults:
   - _self_
-  - env: point_maze
-  - encoder: dino 
+  - env_vars: env_vars
+  - env: pusht
+  # dataset for the env, pusht | pusht_noise | wall.
+  - dataset: pusht_noise
+  - encoder: dino_avg_pool
   - action_encoder: proprio
   - proprio_encoder: proprio
   - decoder: vqvae
   - predictor: vit
   - override hydra/launcher: submitit_slurm
 
-# base path to save model outputs. Checkpoints will be saved to ${ckpt_base_path}/outputs.
-ckpt_base_path: ./ # put absolute path here
+# base path to save model outputs.
+ckpt_base_path: ./   # put absolute path here
 
 hydra:
+  job:
+    chdir: true   # cd into the run dir so checkpoints/, hydra.yaml, plots land there (not the
+                  # launch dir).
   run:
     dir: ${ckpt_base_path}/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
   sweep:
@@ -32,7 +38,7 @@ hydra:
 training:
   seed: 0
   epochs: 100
-  batch_size: 32 # should >= nodes * tasks_per_node
+  batch_size: 32   # should >= nodes * tasks_per_node
   save_every_x_epoch: 1
   reconstruct_every_x_batch: 500
   num_reconstruct_samples: 6
@@ -41,7 +47,7 @@ training:
   predictor_lr: 5e-4
   action_encoder_lr: 5e-4
 
-img_size: 224 # should be a multiple of 224
+img_size: 224   # should be a multiple of 224
 frameskip: 5
 concat_dim: 1
 
@@ -52,13 +58,14 @@ action_emb_dim: 10
 num_action_repeat: 1
 
 # proprio encoder
-proprio_emb_dim: 10 
+proprio_emb_dim: 10
 num_proprio_repeat: 1
 
 num_hist: 3
-num_pred: 1 # only supports 1
-has_predictor: True # set this to False for only training a decoder
-has_decoder: True # set this to False for only training a predictor
+num_pred: 1   # only supports 1
+has_predictor: True   # set this to False for only training a decoder
+# LATENT-ONLY WM (default here), no vqvae decoder is built or trained.
+has_decoder: False
 
 model:
   _target_: models.visual_world_model.VWorldModel
@@ -67,15 +74,27 @@ model:
   num_pred: ${num_pred}
   train_encoder: False
   train_predictor: True
-  train_decoder: True
+  train_decoder: False   # ignored when has_decoder=false (no decoder exists). Set true only with has_decoder=true
 
-debug: False 
+debug: False
 
 # Planning params for planning eval jobs launched during training
-plan_settings: 
-  # plan_cfg_path: conf/plan.yaml # set to null for no planning evals
-  plan_cfg_path: null 
+plan_settings:
+  # plan_cfg_path, conf/plan.yaml # set to null for no planning evals
+  plan_cfg_path: null
+  # Which optimiser searches for the action sequence.
+  #   cem      open-loop cross-entropy method, one search from the initial observation
+  #   mpc_cem  closed-loop, replans from the real state after each committed chunk
+  #   gd       open-loop gradient descent
+  #   mpc_gd   closed-loop gradient descent
   planner: ['gd', 'cem']
+  # Where planning gets its init and goal pairs.
+  #   dset           demo trajectory, goal frameskip * goal_H frames ahead
+  #   random_state   sampled from the env itself with no reference to any demo
+  #   random_action  random action sequence rolled out to define the goal
+  #   valid          demo from the valid split
+  #   train          demo from the train split
+  #   file           read from goal_file_path
   goal_source: ['dset', 'random_state']
   goal_H: [5]
   alpha: [0.1, 1]

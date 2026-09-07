@@ -9,10 +9,10 @@ from .wall_utils import *
 
 
 class Sample(NamedTuple):
-    states: torch.Tensor  # [(batch_size), T, 1, 28, 28]
-    locations: torch.Tensor  # [(batch_size), T, N_DOTS, 2]
-    actions: torch.Tensor  # [(batch_size), T, 2]
-    bias_angle: torch.Tensor  # [(batch_size), 2]
+    states: torch.Tensor   # [(batch_size), T, 1, 28, 28]
+    locations: torch.Tensor   # [(batch_size), T, N_DOTS, 2]
+    actions: torch.Tensor   # [(batch_size), T, 2]
+    bias_angle: torch.Tensor   # [(batch_size), 2]
 
 @dataclass
 class DotDatasetConfig(ConfigBase):
@@ -35,7 +35,7 @@ class DotDatasetConfig(ConfigBase):
     device: str = "cuda"
     repeat_actions: int = 1
     n_steps_reduce_factor: int = 1
-    border_wall_loc: int = 5  # wall located x pixels away from border
+    border_wall_loc: int = 5   # wall located x pixels away from border
 
 class DotDataset:
     def __init__(
@@ -67,10 +67,10 @@ class DotDataset:
         c = torch.stack([xx, yy], dim=-1)
         c = c.view(*([1] * (len(locations.shape) - 1)), *c.shape).repeat(
             *locations.shape[:-1], *([1] * len(c.shape))
-        )  # repeat the number of times required for locations.
+        )   # repeat the number of times required for locations.
         locations = locations.unsqueeze(-2).unsqueeze(
             -2
-        )  # add dims for compatibility with c
+        )   # add dims for compatibility with c
         img = torch.exp(
             -(c - locations).norm(dim=-1).pow(2)
             / (2 * self.config.dot_std * self.config.dot_std)
@@ -89,13 +89,7 @@ class DotDataset:
         Parameters:
             wall_locs (bs)
             door_locs (bs)
-            n_steps: int
-
-        Output:
-            location (bs, 2)
-            actions (bs, n_steps-1, 2)
-            bias_angle (bs, 2)
-        """
+            n_steps: int"""
         location = self.generate_state(wall_locs=wall_locs, door_locs=door_locs)
         actions, bias_angle = self.generate_actions(n_steps=n_steps)
         return location, actions, bias_angle
@@ -187,7 +181,7 @@ class DotDataset:
         return Sample(states, locations, actions, bias_angle)
 
     def generate_transition(self, location, action):
-        next_location = location + action  # [..., :-1] * action[..., -1]
+        next_location = location + action   # [..., :-1] * action[..., -1]
         return next_location
 
     def generate_actions(

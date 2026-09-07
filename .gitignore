@@ -4,3 +4,4 @@ outputs
 plan_outputs
 wandb
 policy_outputs
+dagger

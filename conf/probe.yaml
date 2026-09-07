@@ -1,0 +1,54 @@
+defaults:
+  - _self_
+  - env_vars: env_vars
+  - dataset: pusht_noise   # which dataset's (image, state) pairs to probe (conf/dataset/*)
+  - encoder: dino   # base encoder. Must be DINO-family, exposes cls + patch tokens
+  - override hydra/launcher: submitit_slurm
+
+# which env's state layout, for readable per-component metric names, pusht | wall | other
+env_name: pusht
+
+# dataset loader args, the dataset group config interpolates these
+img_size: 224
+normalize_action: true
+num_hist: 1
+num_pred: 1
+frameskip: 1
+
+# --- probe study ---------------------------------------------------------------------------
+# Representations to fit a probe for.
+#   patches -> full DINO patch tokens (N x D), flattened. Keeps spatial layout.
+#   pooled  -> avg over patch tokens (D). What dino_avg_pool feeds BC/planning.
+#   cls     -> the CLS token (D). Global summary token.
+reps: [patches, pooled, cls]
+probe_hidden: 0   # 0 = LINEAR probe (standard), >0 = one hidden layer of this width
+probe_dropout: 0.0   # input(+hidden) dropout 0-0.7, a strong regularizer for the
+                               # high-dim `patches` probe.
+max_frames: 200000   # cap encoded (image, state) pairs from the TRAIN split (val uses /5)
+encode_batch_size: 64   # batch size for the frozen-encoder feature extraction
+
+# optim / training.
+optim:
+  lr: 1.0e-5
+  weight_decay: 1.0e-4   # ridge-ish. Matters most for the high-dim `patches` probe
+  betas: [0.9, 0.999]
+batch_size: 256
+epochs: 500
+eval_freq: 25   # eval on val every N epochs
+save_every: 25
+seed: 42
+device: cuda
+
+wandb:
+  project: dino_wm_probe
+  entity: null
+wandb_logging: true
+
+hydra:
+  job:
+    chdir: true   # cd into the run dir so checkpoints/, summary.json, compare.png land there
+  run:
+    dir: ./probe_outputs/${now:%Y%m%d%H%M%S}_${hydra:runtime.choices.dataset}_${hydra:runtime.choices.encoder}
+  sweep:
+    dir: ./probe_outputs/${now:%Y%m%d%H%M%S}_${hydra:runtime.choices.dataset}_${hydra:runtime.choices.encoder}
+    subdir: ${hydra.job.num}

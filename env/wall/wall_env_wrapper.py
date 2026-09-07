@@ -3,7 +3,7 @@ from .envs.wall import WallDatasetConfig
 import numpy as np
 import torch
 import random
-from torchvision import transforms  
+from torchvision import transforms
 
 
 from utils import aggregate_dct
@@ -50,28 +50,28 @@ DEFAULT_CFG = WallDatasetConfig(
 
 resize_transform = transforms.Resize((224, 224))
 TRANSFORM = resize_transform
-    
+
 class WallEnvWrapper(DotWall):
-    def __init__(self, rng=42, wall_config=DEFAULT_CFG, fix_wall=True, cross_wall=False, fix_wall_location=32, fix_door_location=10, device='cpu', **kwargs):
-        super().__init__(rng, wall_config, fix_wall, cross_wall, fix_wall_location=fix_wall_location, fix_door_location=fix_door_location, device=device,**kwargs)
+    def __init__(self, rng=42, wall_config=DEFAULT_CFG, fix_wall=True, cross_wall=False, fix_wall_location=32, fix_door_location=10, device='cpu', sample_padding=None, **kwargs):
+        super().__init__(rng, wall_config, fix_wall, cross_wall, fix_wall_location=fix_wall_location, fix_door_location=fix_door_location, device=device, sample_padding=sample_padding, **kwargs)
         self.action_dim = ENV_ACTION_DIM
         self.transform = TRANSFORM
 
     def eval_state(self, goal_state, cur_state):
-        success = np.linalg.norm(goal_state[:2] - cur_state[:2]) < 4.5 
+        success = np.linalg.norm(goal_state[:2] - cur_state[:2]) < 4.5
         state_dist = np.linalg.norm(goal_state - cur_state)
         return {
             'success': success,
             'state_dist': state_dist,
         }
-    
+
     def sample_random_init_goal_states(self, seed):
         """
         Return a random state
         """
         return self.generate_random_state(seed)
-    
-    def update_env(self, env_info): # change door and wall locations
+
+    def update_env(self, env_info):   # change door and wall locations
         self.wall_config.fix_door_location = env_info["fix_door_location"].item()
         self.wall_config.fix_wall_location = env_info["fix_wall_location"].item()
         layouts, other_layouts = generate_wall_layouts(self.wall_config)
@@ -124,5 +124,3 @@ class WallEnvWrapper(DotWall):
         states = np.vstack([np.expand_dims(state, 0), infos["state"]])
         states = np.stack(states)
         return obses, states
-
-    

@@ -1,3 +1,5 @@
+from __future__ import annotations   # lazy annotations so zarr.Array hints don't eval when zarr is absent
+
 from typing import Union, Dict, Callable
 
 import numpy as np
@@ -7,7 +9,7 @@ import torch.nn as nn
 try:
     import zarr
     _ZARR_ARRAY = zarr.Array
-except ImportError:  # zarr is optional; only used for isinstance checks
+except ImportError:   # zarr is optional, only used for isinstance checks
     zarr = None
     _ZARR_ARRAY = ()
 
@@ -60,8 +62,7 @@ class DictOfTensorMixin(nn.Module):
                 value: torch.Tensor
                 if key.startswith(prefix):
                     param_keys = key[len(prefix) :].split(".")[1:]
-                    # if len(param_keys) == 0:
-                    #     import pdb; pdb.set_trace()
+                    # if len(param_keys) == 0, import pdb, pdb.set_trace()
                     dfs_add(out_dict, param_keys, value.clone())
             return out_dict
 

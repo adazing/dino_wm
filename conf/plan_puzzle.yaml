@@ -1,0 +1,71 @@
+# Planning config for OGBench Puzzle.
+defaults:
+  - _self_
+  - override hydra/launcher: submitit_slurm
+
+hydra:
+  run:
+    dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_gH${goal_H}
+  sweep:
+    dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_gH${goal_H}
+    subdir: ${hydra.job.num}
+  launcher:
+    submitit_folder: ${hydra.sweep.dir}/.submitit/%j
+    nodes: 1
+    tasks_per_node: 1
+    cpus_per_task: 16
+    mem_gb: 256
+    gres: "gpu:h100:1"
+    qos: "explore"
+    timeout_min: 720
+
+ckpt_base_path: ./checkpoints   # absolute path. Models load from ${ckpt_base_path}/outputs
+model_name: null   # REQUIRED. The puzzle WM run folder
+model_epoch: latest
+
+seed: 99
+n_evals: 50
+# Where planning gets its init and goal pairs.
+#   dset           demo trajectory, goal frameskip * goal_H frames ahead
+#   random_state   sampled from the env itself with no reference to any demo
+#   random_action  random action sequence rolled out to define the goal
+#   valid          demo from the valid split
+#   train          demo from the train split
+#   file           read from goal_file_path
+goal_source: 'random_state'
+goal_H: 10
+n_plot_samples: 10
+
+# Per-run env kwarg overrides merged over the WM's saved env config.
+env_kwargs: {}
+
+debug_dset_init: False
+
+objective:
+  _target_: planning.objectives.create_objective_fn
+  # alpha=0 drops the proprio term.
+  alpha: 0
+  base: 2
+  mode: last
+
+# Which optimiser searches for the action sequence.
+#   cem      open-loop cross-entropy method, one search from the initial observation
+#   mpc_cem  closed-loop, replans from the real state after each committed chunk
+#   gd       open-loop gradient descent
+#   mpc_gd   closed-loop gradient descent
+planner:
+  _target_: planning.mpc.MPCPlanner
+  max_iter: 20
+  n_taken_actions: 10   # overridden to goal_H by PlanWorkspace. Kept in sync for clarity
+  sub_planner:
+    target: planning.cem.CEMPlanner
+    horizon: 10   # likewise overridden to goal_H
+    topk: 30
+    num_samples: 300
+    var_scale: 1
+    opt_steps: 30
+    eval_every: 1
+    stop_loss_thresh: null
+    patience: null
+    min_delta: 0.0
+  name: mpc_cem

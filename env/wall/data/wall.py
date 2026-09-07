@@ -10,12 +10,12 @@ from .wall_utils import *
 
 
 class WallSample(NamedTuple):
-    states: torch.Tensor  # [(batch_size), T, 1, 28, 28]
-    locations: torch.Tensor  # [(batch_size), T, 2]
-    actions: torch.Tensor  # [(batch_size), T, 2]
-    bias_angle: torch.Tensor  # [(batch_size), 2]
-    wall_x: torch.Tensor  # [(batch_size), 1]
-    door_y: torch.Tensor  # [(batch_size), 1]
+    states: torch.Tensor   # [(batch_size), T, 1, 28, 28]
+    locations: torch.Tensor   # [(batch_size), T, 2]
+    actions: torch.Tensor   # [(batch_size), T, 2]
+    bias_angle: torch.Tensor   # [(batch_size), 2]
+    wall_x: torch.Tensor   # [(batch_size), 1]
+    door_y: torch.Tensor   # [(batch_size), 1]
 
 
 @dataclass
@@ -28,10 +28,10 @@ class WallDatasetConfig(DotDatasetConfig):
     door_padding: int = 10
     wall_width: int = 1
     door_space: int = 2
-    exclude_wall_train: str = ""  # don't generate wall at these x-axis values
-    exclude_door_train: str = ""  # don't generate door at these y-axis values
-    only_wall_val: str = ""  # only evalaute wall at these x-axis values
-    only_door_val: str = ""  # only evaluate door at these y-axis values
+    exclude_wall_train: str = ""   # don't generate wall at these x-axis values
+    exclude_door_train: str = ""   # don't generate door at these y-axis values
+    only_wall_val: str = ""   # only evalaute wall at these x-axis values
+    only_door_val: str = ""   # only evaluate door at these y-axis values
     fix_wall_location: Optional[int] = None
     fix_door_location: Optional[int] = None
     num_train_layouts: Optional[int] = -1
@@ -189,8 +189,8 @@ class WallDataset(DotDataset):
         wall_left = walls - half_width
         wall_right = walls + half_width
 
-        # Determine the relative positions of the current and next locations to the wall's boundaries
-        # Check if the x-coordinates are less than the right boundary of the wall
+        # Determine the relative positions of the current and next locations to the wall's
+        # boundaries Check if the x-coordinates are less than the right boundary of the wall
         current_right = current_location[:, 0] <= wall_right
         next_right = next_location[:, 0] <= wall_right
 
@@ -198,9 +198,9 @@ class WallDataset(DotDataset):
         current_left = current_location[:, 0] >= wall_left
         next_left = next_location[:, 0] >= wall_left
 
-        # Evaluate intersection conditions:
-        # Case 1: One point is inside the wall boundaries and the other is outside
-        # Case 2: Both points are outside the wall boundaries but on opposite sides of the wall
+        # Evaluate intersection conditions, Case 1, One point is inside the wall boundaries and
+        # the other is outside Case 2, Both points are outside the wall boundaries but on opposite
+        # sides of the wall
         inside_wall = (current_right & current_left) != (next_right & next_left)
         across_wall = (current_right != next_right) & (current_left != next_left)
 
@@ -279,19 +279,19 @@ class WallDataset(DotDataset):
             the segment from B[i][0] to B[i][1]
         """
         # Extract points
-        A0, A1 = A[:, 0], A[:, 1]  # Endpoints of segment A
-        B0, B1 = B[:, 0], B[:, 1]  # Endpoints of segment B
+        A0, A1 = A[:, 0], A[:, 1]   # Endpoints of segment A
+        B0, B1 = B[:, 0], B[:, 1]   # Endpoints of segment B
 
         # Direction vectors
-        dA = A1 - A0  # Direction vector of segment A
-        dB = B1 - B0  # Direction vector of segment B
+        dA = A1 - A0   # Direction vector of segment A
+        dB = B1 - B0   # Direction vector of segment B
 
         # Helper function to compute cross product of 2D vectors
         def cross_2d(v, w):
             return v[:, 0] * w[:, 1] - v[:, 1] * w[:, 0]
 
-        # Translate points to origin based on one endpoint of each segment
-        # Check orientation of other segment's endpoints relative to this segment
+        # Translate points to origin based on one endpoint of each segment Check orientation of
+        # other segment's endpoints relative to this segment
         B0_to_A0 = B0 - A0
         B1_to_A0 = B1 - A0
         A0_to_B0 = A0 - B0
@@ -303,12 +303,13 @@ class WallDataset(DotDataset):
         cross_B_A0 = cross_2d(dB, A0_to_B0)
         cross_B_A1 = cross_2d(dB, A1_to_B0)
 
-        # Intersection condition: opposite signs of cross products indicate the points are on opposite sides
-        intersect_A = cross_A_B0 * cross_A_B1 < 0  # B endpoints on opposite sides of A
-        intersect_B = cross_B_A0 * cross_B_A1 < 0  # A endpoints on opposite sides of B
+        # Intersection condition, opposite signs of cross products indicate the points are on
+        # opposite sides
+        intersect_A = cross_A_B0 * cross_A_B1 < 0   # B endpoints on opposite sides of A
+        intersect_B = cross_B_A0 * cross_B_A1 < 0   # A endpoints on opposite sides of B
 
-        # Combine conditions for full intersection test
-        # Use logical AND: both conditions must be true for segments to intersect
+        # Combine conditions for full intersection test Use logical AND, both conditions must be
+        # true for segments to intersect
         intersection = intersect_A & intersect_B
 
         # Return results as 1 (intersect) or 0 (no intersect)

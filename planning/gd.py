@@ -40,6 +40,9 @@ class GDPlanner(BasePlanner):
         self.opt_steps = opt_steps
         self.eval_every = eval_every
         self.logging_prefix = logging_prefix
+        # added to the logged "step" so callers can place each plan() on one continuous wandb axis
+        # (e.g.
+        self.log_step_offset = 0
 
     def init_actions(self, obs_0, actions=None):
         """
@@ -55,7 +58,7 @@ class GDPlanner(BasePlanner):
         if remaining_t > 0:
             if self.sample_type == "randn":
                 new_actions = torch.randn(n_evals, remaining_t, self.action_dim)
-            elif self.sample_type == "zero":  # zero action of env
+            elif self.sample_type == "zero":   # zero action of env
                 new_actions = torch.zeros(n_evals, remaining_t, self.action_dim)
                 new_actions = rearrange(
                     new_actions, "... (f d) -> ... f d", f=self.evaluator.frameskip
@@ -95,27 +98,27 @@ class GDPlanner(BasePlanner):
                 obs_0=trans_obs_0,
                 act=actions,
             )
-            loss = self.objective_fn(i_z_obses, z_obs_g_detached)  # (n_evals, )
-            total_loss = loss.mean() * n_evals  # loss for each eval is independent
+            loss = self.objective_fn(i_z_obses, z_obs_g_detached)   # (n_evals, )
+            total_loss = loss.mean() * n_evals   # loss for each eval is independent
             total_loss.backward()
             with torch.no_grad():
                 actions_new = actions - optimizer.param_groups[0]["lr"] * actions.grad
                 actions_new += (
                     torch.randn_like(actions_new) * self.action_noise
-                )  # Add Gaussian noise
+                )   # Add Gaussian noise
                 actions.copy_(actions_new)
 
             self.wandb_run.log(
-                {f"{self.logging_prefix}/loss": total_loss.item(), "step": i + 1}
+                {f"{self.logging_prefix}/loss": total_loss.item(), "step": self.log_step_offset + i + 1}
             )
-            if self.evaluator is not None and i % self.eval_every == 0:
+            if self.evaluator is not None and self.eval_every is not None and i % self.eval_every == 0:
                 logs, successes, _, _ = self.evaluator.eval_actions(
                     actions.detach(), filename=f"{self.logging_prefix}_output_{i+1}"
                 )
                 logs = {f"{self.logging_prefix}/{k}": v for k, v in logs.items()}
-                logs.update({"step": i + 1})
+                logs.update({"step": self.log_step_offset + i + 1})
                 self.wandb_run.log(logs)
                 self.dump_logs(logs)
                 if np.all(successes):
-                    break  # terminate planning if all success
-        return actions, np.full(n_evals, np.inf)  # all actions are valid
+                    break   # terminate planning if all success
+        return actions, np.full(n_evals, np.inf)   # all actions are valid

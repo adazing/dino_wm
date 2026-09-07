@@ -42,7 +42,7 @@ def create_normal_dist(
     if event_shape:
         dist = torch.distributions.Independent(dist, event_shape)
     return dist
-    
+
 
 class TransposedConvDecoder(nn.Module):
     def __init__(self, observation_shape=(3, 224, 224), emb_dim=512, activation=nn.ReLU, depth=32, kernel_size=5, stride=3):
@@ -111,4 +111,4 @@ class TransposedConvDecoder(nn.Module):
         dist = create_normal_dist(x, std=1, event_shape=len(self.observation_shape))
         img = dist.mean.squeeze(2)
         img = einops.rearrange(img, "b t c h w -> (b t) c h w")
-        return img, torch.zeros(1).to(posterior.device) # dummy placeholder
+        return img, torch.zeros(1).to(posterior.device)   # dummy placeholder

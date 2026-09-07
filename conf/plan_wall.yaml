@@ -1,5 +1,6 @@
 defaults:
   - _self_
+  - planner: cem
   - override hydra/launcher: submitit_slurm
 
 hydra:
@@ -22,34 +23,82 @@ hydra:
             "export MASTER_PORT=$(for port in $(shuf -i 30000-65500 -n 20); do if [[ $(netstat -tupln 2>&1 | grep $port | wc -l) -eq 0 ]] ; then echo $port; break; fi; done;)",]
 
 # model to load for planning
-ckpt_base_path: ./checkpoints   # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
-model_name: null
-model_epoch: latest
+ckpt_base_path: /nas/ada/dev/dino_wm/   # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
+model_name: 2026-08-14/13-07-36
+model_epoch: 89
 
 seed: 99
+# Make world-model rollouts inside the planner reproducible. Slower.
+deterministic: false
 n_evals: 50
+# Where planning gets its init and goal pairs.
+#   dset           demo trajectory, goal frameskip * goal_H frames ahead
+#   random_state   sampled from the env itself with no reference to any demo
+#   random_action  random action sequence rolled out to define the goal
+#   valid          demo from the valid split
+#   train          demo from the train split
+#   file           read from goal_file_path
 goal_source: 'random_state'
-goal_H: 5 
+goal_H: 5
 n_plot_samples: 10
+
+# Which split planning samples its init and goal pairs from.
+#   train       demos from the train split
+#   val         held-out demos never trained on
+#   both        train and val concatenated
+#   eval_pairs  reproduce the exact episodes the BC eval scores on
+source_split: train
+eval_split: valid   # eval_pairs only, split the eval draws goals from (valid | train)
+
+# Plan to the demo's final frame instead of a fixed goal_H ahead. Not compatible with provided_states_path.
+plan_to_end: false
+
+source_max_trajectories: null
+
+original_max_trajectories: null
+original_segment_length: null
+original_subset_seed: null
+
+num_trajectories: 10000
+
+eval_seed: 42   # the BC run's cfg.seed (the eval draws Random(eval_seed + episode_idx))
+n_eval_episodes: 100   # the eval's episode count = (n_env_evals // n_envs) * n_envs
+eval_goal_offset: null   # null -> frameskip*goal_H. Must equal it (the eval's goal_offset)
+
+# Roll the plan out in imagination instead of the real env. Must stay false to produce usable data.
+dream: false
+
+mpc_max_iter: 100
 
 debug_dset_init: False
 
+# Weight on the proprio term in loss_visual + alpha * loss_proprio.
 objective:
   _target_: planning.objectives.create_objective_fn
   alpha: 1
-  base: 2 
+  base: 2
   mode: last
 
-planner:
-  _target_: planning.mpc.MPCPlanner
-  max_iter: null 
-  n_taken_actions: 5
-  sub_planner:
-    target: planning.cem.CEMPlanner
-    horizon: 5
-    topk: 30
-    num_samples: 300
-    var_scale: 1
-    opt_steps: 10
-    eval_every: 1
-  name: mpc_cem
+# --- generate_planned_trajectories.py only (ignored by plan.py) ---
+n_planning_rounds: 10000   # number of planning rounds. Total trajs = rounds * n_evals (here 2000*10=20000)
+planned_out_path: ./planned_wall.pth
+# Train only on planned trajectories that reached their goal.
+planned_only_successes: false   # keep only trajectories that reached the goal
+
+wandb_logging: true
+wandb:
+  project: dino_wm_planning
+  entity: null   # wandb username/team, or null for the default
+
+shard_every: 1
+
+# how often the evaluator saves visuals to the Hydra run dir.
+save_figure_every: 50   # env-vs-imagined comparison.png
+save_video_every: 50   # rollout.mp4 videos
+
+# replace the dataset path saved in the WM config.
+override_dataset_path: /nas/ada/dev/dino/data/wall_single
+
+# planner, _target_, planning.mpc.MPCPlanner max_iter, null n_taken_actions, 5 sub_planner,
+# target, planning.cem.CEMPlanner horizon, 5 topk, 30 num_samples, 300 var_scale, 1 opt_steps, 10
+# eval_every, 1 name, mpc_cem

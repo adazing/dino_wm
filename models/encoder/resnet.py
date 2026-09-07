@@ -27,6 +27,7 @@ class resnet18(nn.Module):
         self.emb_dim = 512
         self.output_dim = 512
         self.n_patches = 1
+        self.patch_size = None
         self.name = "resnet"
 
     def forward(self, x):

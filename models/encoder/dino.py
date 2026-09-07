@@ -30,15 +30,21 @@ class DinoV2Encoder(nn.Module):
             if postprocess == 'avg_pool':
                 self.latent_ndim = 1
 
-        # DINOv2 expects ImageNet-normalized inputs derived from pixels in [0, 1].
-        self.normalization = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        # # DINOv2 expects ImageNet-normalized inputs derived from pixels in [0, 1].
+        # self.normalization = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        
+        # Original dino_wm fed DINO images in [-1, 1] (default_transform's
+        # Normalize(0.5, 0.5)), NOT ImageNet-normalized. Reproduce that here so
+        # existing WM checkpoints work without retraining, while default_transform
+        # stays in [0, 1] for the patch encoders. (x - 0.5) / 0.5 == 2x - 1.
+        self.normalization = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 
     def forward(self, x):
         # Accept arbitrary number of leading dimensions before (C, H, W)
         # and preserve them on return.
         # Example: input shape (...prefix, C, H, W)
         assert x.max() <= 1.0 + 1e-4 and x.min() >= -1e-4, "expect [0,1] range"
-        x = self.normalization(x)
+        x = self.normalization(x)  # [0,1] -> [-1,1], matching original dino_wm
 
         prefix_shape = x.shape[:-3]
         c, h, w = x.shape[-3:]

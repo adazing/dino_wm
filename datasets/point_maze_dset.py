@@ -24,7 +24,7 @@ class PointMazeDataset(TrajDataset):
         states = torch.load(self.data_path / "states.pth").float()
         self.states = states
         self.actions = torch.load(self.data_path / "actions.pth").float()
-        self.actions = self.actions / action_scale  # scaled back up in env
+        self.actions = self.actions / action_scale   # scaled back up in env
         self.seq_lengths = torch.load(self.data_path /'seq_lengths.pth')
 
         self.n_rollout = n_rollout
@@ -57,7 +57,7 @@ class PointMazeDataset(TrajDataset):
 
         self.actions = (self.actions - self.action_mean) / self.action_std
         self.proprios = (self.proprios - self.proprio_mean) / self.proprio_std
-    
+
     def get_data_mean_std(self, data, traj_lengths):
         all_data = []
         for traj in range(len(traj_lengths)):
@@ -70,7 +70,10 @@ class PointMazeDataset(TrajDataset):
         return data_mean, data_std
 
     def get_seq_length(self, idx):
-        return self.seq_lengths[idx]
+        # int(), not the raw element, seq_lengths.pth loads as a TENSOR, and callers use this in
+        # contexts that want a plain int, range() in TrajSlicerDataset and random.randint(0,
+        # max_offset) in plan.py's sample_traj_segment_from_dset.
+        return int(self.seq_lengths[idx])
 
     def get_all_actions(self):
         result = []
@@ -86,8 +89,12 @@ class PointMazeDataset(TrajDataset):
         act = self.actions[idx, frames]
         state = self.states[idx, frames]
 
-        image = image[frames]  # THWC
-        image = image / 255.0
+        image = image[frames]   # THWC
+        # .float() before the divide, matching pusht/puzzle. Without it the stored dtype is
+        # preserved, a uint8 episode promotes to float32 (fine), but a float64 one stays float64
+        # and DINO's patch-embed conv dies with RuntimeError, Input type (double) and bias type
+        # (float) should be the same, the model's weights are float32.
+        image = image.float() / 255.0
         image = rearrange(image, "T H W C -> T C H W")
         if self.transform:
             image = self.transform(image)
@@ -95,7 +102,7 @@ class PointMazeDataset(TrajDataset):
             "visual": image,
             "proprio": proprio
         }
-        return obs, act, state, {} # env_info
+        return obs, act, state, {}   # env_info
 
     def __getitem__(self, idx):
         return self.get_frames(idx, range(self.get_seq_length(idx)))
@@ -107,8 +114,8 @@ class PointMazeDataset(TrajDataset):
         if isinstance(imgs, np.ndarray):
             raise NotImplementedError
         elif isinstance(imgs, torch.Tensor):
-            return rearrange(imgs, "b h w c -> b c h w") / 255.0
-        
+            return rearrange(imgs.float(), "b h w c -> b c h w") / 255.0
+
 def load_point_maze_slice_train_val(
     transform,
     n_rollout=50,
@@ -126,9 +133,9 @@ def load_point_maze_slice_train_val(
         normalize_action=normalize_action,
     )
     dset_train, dset_val, train_slices, val_slices = get_train_val_sliced(
-        traj_dataset=dset, 
-        train_fraction=split_ratio, 
-        num_frames=num_hist + num_pred, 
+        traj_dataset=dset,
+        train_fraction=split_ratio,
+        num_frames=num_hist + num_pred,
         frameskip=frameskip
     )
 

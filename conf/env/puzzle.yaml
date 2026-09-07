@@ -1,0 +1,29 @@
+# OGBench Puzzle ("Lights Out"), a UR5e pressing a grid of physical buttons, where each press
+# toggles the pressed button AND its four orthogonal neighbours.
+name: puzzle
+args: []
+kwargs:
+  # Board size, '3x3' | '4x4' | '4x5' | '4x6'.
+  env_type: '3x3'
+  # Press-distance from init to goal.
+  k: 1
+  img_size: ${img_size}
+  # Where the arm is posed in the goal image.
+  #   canonical  fixed pose, so only the buttons differ between init and goal
+  #   init       same pose the episode started from
+  #   random     independently sampled pose
+  goal_arm_mode: canonical
+  transparent_arm: true
+
+# 5-D relative end-effector control, dx, dy, dz, dyaw, dgripper.
+act_dim: 5
+goal_dim: 0
+views: 1
+# No coverage metric.
+has_coverage: false
+
+# DATASET chosen via the `dataset` group, use dataset=puzzle with this env.
+dataset: ${dataset}
+
+decoder_path: null
+num_workers: 16

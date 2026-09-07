@@ -1,4 +1,4 @@
-# ResNet18 patch tokens from layer2. At 224x224 this gives 28x28 = 784 patches.
+# ResNet18 patch tokens from layer2.
 _target_: models.encoder.resnet.Resnet18Patches
 pretrained: True
 output_dim: 256

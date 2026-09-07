@@ -1,0 +1,173 @@
+# DAgger for the WALL env, the policy scouts, the WM+planner relabels, the pool aggregates.
+defaults:
+  - _self_
+  - env_vars: env_vars
+  - env: wall
+  - dataset: wall
+  - encoder: dino_avg_pool
+  - policy: vqbet
+
+hydra:
+  # dagger_loop stays in the repo root so it can spawn the other scripts by name, so a run dir
+  # of '.' would drop Hydra's .hydra/ bookkeeping here. Nothing reads it, the loop records what
+  # it needs in out_dir.
+  output_subdir: null
+  job:
+    chdir: false   # the loop owns its paths (out_dir) and gives each subprocess an explicit
+                   # hydra.run.dir.
+  run:
+    dir: .
+
+# --- the frozen world model = the EXPERT (REQUIRED) -----------------------------------------
+ckpt_base_path: /nas/ada/dev/dino_wm
+model_name: 2026-08-14/13-07-36   # REQUIRED, the wall WM run under ${ckpt_base_path}/outputs/
+model_epoch: 89
+
+# --- where everything lands -----------------------------------------------------------------
+# Root for everything this run writes. Timestamped per launch, so a rerun never resumes or
+# overwrites a previous one.
+#   pool/                            aggregated dataset, never pruned
+#   rounds/round_NN/gen/             generation run dirs
+#   rounds/round_NN/train/           training run dir
+#   rounds/round_NN/relabel_states.pth   init and goal pairs sent to the planner
+#   rounds/round_NN/policy_rollout.pth   policy's scouting record
+#   dagger_summary.json              per-round bookkeeping
+out_dir: /nas/ada/dev/dino_wm/dagger/${now:%Y%m%d%H%M%S}_${env.name}_${beta_schedule}
+seed: 100000
+
+# --- the loop -------------------------------------------------------------------------------
+rounds: 10
+# Trajectories added to the pool per round, split by beta between planner-driven (random
+# init/goal) and policy-scouted (relabelled) episodes.
+trajectories_per_round: 100
+
+# --- beta, who drives -----------------------------------------------------------------------
+# Fraction of each round's episodes driven by the planner instead of the policy.
+#   constant_1    planner every round, no policy rollout and no relabelling
+#   first_only    planner on round 0, policy every round after
+#   exponential   beta_p ** round, a gradual handover
+#   constant_<x>  fixed mix such as constant_0.3
+beta_schedule: first_only
+beta_p: 0.5
+# Optional warm start, an existing policy checkpoint to scout with on round 0.
+init_checkpoint: null
+
+# --- policy scouting (the DAgger half) ------------------------------------------------------
+rollout_episodes: 200   # policy rollouts per round. CHEAP, forward passes, no search
+rollout_horizon: 300   # env steps per rollout
+# Relabel only episodes the policy failed. Falls back to all episodes if none failed.
+relabel_failures_only: true
+# null = draw from every candidate episode, letting beta's share decide how many states are
+# actually used.
+episodes_to_relabel: null
+# Which rollout episodes to relabel when episodes_to_relabel caps the count.
+#   worst   furthest the policy ever got from its goal
+#   random  uniform sample
+episode_pick: worst   # worst = furthest the policy ever got from the goal | random
+# Prefer MANY episodes x FEW states over the reverse, several states from one rollout all aim at
+# the SAME goal, so the planner's trajectories from them overlap heavily.
+states_per_episode: 1
+# Which visited states along a policy rollout get relabelled. Index 0 is never picked.
+#   late                     spread over the last state_sample_late_frac of the episode
+#   uniform                  evenly spaced across the whole episode
+#   random                   uniform at random over the whole episode, no repeats
+#   random_with_replacement  independent draws, duplicates allowed
+state_sample_mode: random
+# Fraction of the episode counted as late. Used only by state_sample_mode late.
+state_sample_late_frac: 0.5
+
+# --- generation ------------------------------------------------------------------------------
+# gen_wall_random.yaml supplies the Phase 1 settings (planner, real env execution,
+# planned_only_successes=false, dream=false).
+gen_config_name: gen_wall_random
+gen_overrides: []
+shard_every: 5
+
+# --- policy scouting, where the tasks come from ---------------------------------------------
+# Where the scouting rollout's init and goal pairs come from.
+#   random_state  sampled from the env itself, matching the reach_rs eval pass
+#   valid         demo trajectory from the valid split, goal rollout_goal_offset frames later
+#   train         same from the train split
+rollout_goal_source: random_state
+rollout_goal_offset: 25
+
+# Run every env in this process instead of forked subprocesses. Slower but avoids EGL failures under fork.
+serial_env: false
+# How env worker processes are created.
+#   null        fork, the Python default
+#   fork        copies this process, fast, but EGL state does not survive the copy
+#   spawn       fresh interpreter per worker, needed for MuJoCo envs that render
+#   forkserver  children fork from one clean server process
+env_start_method: null
+
+# Demo dataset folder.
+override_dataset_path: null
+
+# --- wandb identity ---------------------------------------------------------------------------
+# Each round launches two subprocesses.
+#   wandb_project null -> generation logs to dino_wm_planning.
+#   <name> -> BOTH log there, so a whole dagger run sits in one group.
+#   wandb_group   null -> auto "<env>-<basename(out_dir)>-<beta_schedule>".
+wandb_project: dino_wm_dagger
+wandb_group: null
+
+# --- training --------------------------------------------------------------------------------
+# Which trajectories the policy trains on.
+#   original  demonstrations only
+#   planned   world-model planned trajectories only
+#   both      concatenated, weighted by window count rather than 50/50
+data_source: planned
+# BUFFER / QUEUE.
+#   recent -> chronological queue, the newest N, what "buffer" usually means
+#   random -> N drawn from the WHOLE pool, reseeded every round.
+train_max_trajectories: null
+# Which trajectories a round loads when train_max_trajectories caps the pool.
+#   first                    oldest N
+#   recent                   newest N, a chronological queue
+#   random                   N drawn from the whole pool, reseeded every round
+#   random_with_replacement  independent draws, duplicates allowed
+train_selection: first
+# Start each round from the previous round's weights instead of training from scratch.
+warm_start: false
+# Which train config each round composes (conf/<name>.yaml).
+train_config_name: train_policy_wall
+# Mirrors the existing wall BC settings, so per-round wandb curves, eval videos
+# and eval passes look exactly like a normal training run.
+train_overrides:
+  - env=wall
+  - dataset=wall
+  - encoder=dino_avg_pool
+  - policy=vqbet
+  - goal_conditional=true
+  - future_conditional=true
+  - planned_only_successes=true   # wall, train on trajectories that reached the goal
+  - seed=42
+  - batch_size=16
+  - epochs=1000   # per ROUND (5000 x 10 rounds would be enormous)
+  - save_every=50
+  - eval_freq=10
+  - eval_on_env_freq=50
+  - n_env_evals=100
+  - n_envs=10
+  - eval_horizon=300
+  - save_eval_video=true
+  - n_eval_videos=10
+  - eval_video_fps=12
+  - wandb_logging=true
+  # Wall eval passes, held-out demos, the trained-on split, and the env-sampled across-the-wall
+  # reach.
+  - 'eval_passes=[{name:goal25_valid,type:goal,goal_offset:25,horizon:300,goal_source:valid},{name:goal25_train,type:goal,goal_offset:25,horizon:300,goal_source:train},{name:reach_rs,type:goal,horizon:300,goal_source:random_state}]'
+
+# --- policy-side settings, must match the checkpoint being scouted -------------------------
+# The rollout stacks window_size observations and ensembles over action_window_size, exactly as
+# eval_on_env does, so these have to be the values the policy was trained with.
+n_envs: 10
+eval_horizon: 300
+window_size: 5
+action_window_size: 5
+img_size: 224
+num_hist: 1
+num_pred: 1
+frameskip: 1
+normalize_action: true
+goal_conditional: true

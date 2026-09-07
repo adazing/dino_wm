@@ -1,22 +1,20 @@
 name: wall
 args: []
-kwargs: {}
+# sample_padding is the clearance generate_random_state keeps from the wall and the borders when
+# it samples init/goal pairs.
+#   0  removes the guarantee, leaving only enough room to stay out of solid geometry.
+kwargs:
+  sample_padding: null
 
 # action / goal / view dims for the BC policy
 act_dim: 2
 goal_dim: 0
 views: 1
+# wall has no coverage, a 'task' eval pass reports eval_state success/distance, like a goal pass.
+has_coverage: false
 
-dataset:
-  _target_: "datasets.wall_dset.load_wall_slice_train_val"
-  n_rollout: null
-  normalize_action: ${normalize_action}
-  data_path: ${oc.env:DATASET_DIR}/wall_single
-  split_ratio: 0.9
-  split_mode: "random"
-  transform:
-    _target_: "datasets.img_transforms.default_transform"
-    img_size: ${img_size}
+# DATASET chosen via the `dataset` group, use dataset=wall with this env.
+dataset: ${dataset}
 
 decoder_path: null
 num_workers: 16

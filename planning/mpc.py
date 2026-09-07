@@ -18,7 +18,7 @@ class MPCPlanner(BasePlanner):
         n_taken_actions,
         sub_planner,
         wm,
-        env,  # for online exec
+        env,   # for online exec
         action_dim,
         objective_fn,
         preprocessor,
@@ -48,12 +48,12 @@ class MPCPlanner(BasePlanner):
             action_dim=self.action_dim,
             objective_fn=self.objective_fn,
             preprocessor=self.preprocessor,
-            evaluator=self.evaluator,  # evaluator is shared for mpc and sub_planner
+            evaluator=self.evaluator,   # evaluator is shared for mpc and sub_planner
             wandb_run=self.wandb_run,
             log_filename=None,
         )
         self.is_success = None
-        self.action_len = None  # keep track of the step each traj reaches success
+        self.action_len = None   # keep track of the step each traj reaches success
         self.iter = 0
         self.planned_actions = []
 
@@ -71,7 +71,7 @@ class MPCPlanner(BasePlanner):
 
     def plan(self, obs_0, obs_g, actions=None):
         """
-        actions is NOT used
+        actions is not used
         Returns:
             actions: (B, T, action_dim) torch.Tensor
         """
@@ -88,7 +88,7 @@ class MPCPlanner(BasePlanner):
                 obs_0=cur_obs_0,
                 obs_g=obs_g,
                 actions=memo_actions,
-            )  # (b, t, act_dim)
+            )   # (b, t, act_dim)
             taken_actions = actions.detach()[:, : self.n_taken_actions]
             self._apply_success_mask(taken_actions)
             memo_actions = actions.detach()[:, self.n_taken_actions :]
@@ -106,13 +106,13 @@ class MPCPlanner(BasePlanner):
                 filename=f"plan{self.iter}",
                 save_video=True,
             )
-            new_successes = successes & ~self.is_success  # Identify new successes
+            new_successes = successes & ~self.is_success   # Identify new successes
             self.is_success = (
                 self.is_success | successes
-            )  # Update overall success status
+            )   # Update overall success status
             self.action_len[new_successes] = (
                 (self.iter + 1) * self.n_taken_actions
-            )  # Update only for the newly successful trajectories
+            )   # Update only for the newly successful trajectories
 
             print("self.is_success: ", self.is_success)
             logs = {f"{self.logging_prefix}/{k}": v for k, v in logs.items()}

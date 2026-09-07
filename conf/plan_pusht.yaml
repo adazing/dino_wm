@@ -1,4 +1,6 @@
 defaults:
+  # planner group first, then _self_, the group loads and this file may tweak individual keys.
+  - planner: cem
   - _self_
   - override hydra/launcher: submitit_slurm
 
@@ -22,14 +24,21 @@ hydra:
             "export MASTER_PORT=$(for port in $(shuf -i 30000-65500 -n 20); do if [[ $(netstat -tupln 2>&1 | grep $port | wc -l) -eq 0 ]] ; then echo $port; break; fi; done;)",]
 
 # model to load for planning
-ckpt_base_path: ./checkpoints  # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
+ckpt_base_path: ./checkpoints   # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
 model_name: null
 model_epoch: latest
 
 seed: 99
 n_evals: 50
+# Where planning gets its init and goal pairs.
+#   dset           demo trajectory, goal frameskip * goal_H frames ahead
+#   random_state   sampled from the env itself with no reference to any demo
+#   random_action  random action sequence rolled out to define the goal
+#   valid          demo from the valid split
+#   train          demo from the train split
+#   file           read from goal_file_path
 goal_source: 'dset'
-goal_H: 5 
+goal_H: 5
 n_plot_samples: 10
 
 debug_dset_init: False
@@ -40,17 +49,4 @@ objective:
   base: 2
   mode: last
 
-planner:
-  _target_: planning.mpc.MPCPlanner
-  max_iter: null 
-  n_taken_actions: 5
-  sub_planner:
-    target: planning.cem.CEMPlanner
-    horizon: 5
-    topk: 30
-    num_samples: 300
-    var_scale: 1
-    opt_steps: 30
-    eval_every: 1
-  name: mpc_cem
-
+# Planner comes from conf/planner/cem.yaml, opt_steps 30, matching gen_pusht_dset.yaml.

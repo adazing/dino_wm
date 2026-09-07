@@ -18,11 +18,11 @@ class SerialVectorEnv:
     def sample_random_init_goal_states(self, seed):
         init_state, goal_state = zip(*(self.envs[i].sample_random_init_goal_states(seed[i]) for i in range(self.num_envs)))
         return np.stack(init_state), np.stack(goal_state)
-    
+
     def update_env(self, env_info):
         [self.envs[i].update_env(env_info[i]) for i in range(self.num_envs)]
-    
-    def eval_state(self, goal_state, cur_state): 
+
+    def eval_state(self, goal_state, cur_state):
         eval_result = []
         for i in range(self.num_envs):
             env = self.envs[i]
@@ -43,6 +43,15 @@ class SerialVectorEnv:
             cur_seed = seed[i]
             cur_init_state = init_state[i]
             o, s = env.prepare(cur_seed, cur_init_state)
+            # prepare() resets the inner env directly, so mark gym's wrapper stack as reset (else
+            # a later env.step() asserts "before calling reset()").
+            _e = env
+            while _e is not None:
+                if hasattr(_e, "_has_reset"):
+                    _e._has_reset = True
+                if hasattr(_e, "_elapsed_steps"):
+                    _e._elapsed_steps = 0
+                _e = getattr(_e, "env", None)
             obs.append(o)
             state.append(s)
         obs = aggregate_dct(obs)
@@ -74,17 +83,32 @@ class SerialVectorEnv:
         return obses, rewards, dones, infos
 
     def close(self):
+        """Free each env, INCLUDING its MuJoCo offscreen renderer."""
         for env in self.envs:
+            _e = env   # walk the gym wrapper stack to the inner env
+            while _e is not None:
+                if getattr(_e, "_renderer", None) is not None:
+                    try:
+                        _e._renderer.close()
+                    except Exception:
+                        pass
+                    try:
+                        _e._renderer = None
+                    except Exception:
+                        pass
+                _e = getattr(_e, "env", None)
             if hasattr(env, "close"):
-                env.close()
+                try:
+                    env.close()
+                except Exception:
+                    pass
 
     def step(self, actions):
         """Closed-loop single step per env, built on each env's step_multiple
         (length-1 action sequence) so per-env obs processing matches rollout().
 
-        actions: (num_envs, action_dim)
         returns: obs (dict, each key (num_envs, ...)), rewards, dones,
-                 info (tuple of num_envs dicts, each with "state").
+        info (tuple of num_envs dicts, each with "state").
         """
         obses, rewards, dones, infos = [], [], [], []
         for i in range(self.num_envs):

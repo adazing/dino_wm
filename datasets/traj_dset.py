@@ -10,8 +10,8 @@ from einops import rearrange
 # https://github.com/JaidedAI/EasyOCR/issues/1243
 def _accumulate(iterable, fn=lambda x, y: x + y):
     "Return running totals"
-    # _accumulate([1,2,3,4,5]) --> 1 3 6 10 15
-    # _accumulate([1,2,3,4,5], operator.mul) --> 1 2 6 24 120
+    # _accumulate([1,2,3,4,5]) --> 1 3 6 10 15 _accumulate([1,2,3,4,5], operator.mul) --> 1 2 6 24
+    # 120
     it = iter(iterable)
     try:
         total = next(it)
@@ -35,14 +35,19 @@ class TrajSubset(TrajDataset, Subset):
     Subset of a trajectory dataset at specified indices.
 
     Args:
-        dataset (TrajectoryDataset): The whole Dataset
-        indices (sequence): Indices in the whole set selected for subset
+    dataset (TrajectoryDataset): The whole Dataset
+    indices (sequence): Indices in the whole set selected for subset
     """
     def __init__(self, dataset: TrajDataset, indices: Sequence[int]):
         Subset.__init__(self, dataset, indices)
 
     def get_seq_length(self, idx):
         return self.dataset.get_seq_length(self.indices[idx])
+
+    def get_frames(self, idx, frames):
+        # must be defined explicitly. __getattr__ below would forward `get_frames` to the parent
+        # dataset with this subset's LOCAL index, silently reading the wrong trajectory.
+        return self.dataset.get_frames(self.indices[idx], frames)
 
     def __getattr__(self, name):
         if hasattr(self.dataset, name):
@@ -62,7 +67,7 @@ class TrajSlicerDataset(TrajDataset):
         self.num_frames = num_frames
         self.frameskip = frameskip
         self.slices = []
-        for i in range(len(self.dataset)): 
+        for i in range(len(self.dataset)):
             T = self.dataset.get_seq_length(i)
             if T - num_frames < 0:
                 print(f"Ignored short sequence #{i}: len={T}, num_frames={num_frames}")
@@ -70,10 +75,10 @@ class TrajSlicerDataset(TrajDataset):
                 self.slices += [
                     (i, start, start + num_frames * self.frameskip)
                     for start in range(T - num_frames * frameskip + 1)
-                ]  # slice indices follow convention [start, end)
+                ]   # slice indices follow convention [start, end)
         # randomly permute the slices
         self.slices = np.random.permutation(self.slices)
-        
+
         self.proprio_dim = self.dataset.proprio_dim
         if process_actions == "concat":
             self.action_dim = self.dataset.action_dim * self.frameskip
@@ -91,12 +96,13 @@ class TrajSlicerDataset(TrajDataset):
 
     def __getitem__(self, idx):
         i, start, end = self.slices[idx]
-        obs, act, state, _ = self.dataset[i]
+        # Read only the [start, end) window, not the whole trajectory.
+        frames = list(range(start, end))
+        obs, act, state, _ = self.dataset.get_frames(i, frames)
         for k, v in obs.items():
-            obs[k] = v[start:end:self.frameskip]
-        state = state[start:end:self.frameskip]
-        act = act[start:end]
-        act = rearrange(act, "(n f) d -> n (f d)", n=self.num_frames)  # concat actions
+            obs[k] = v[::self.frameskip]
+        state = state[::self.frameskip]
+        act = rearrange(act, "(n f) d -> n (f d)", n=self.num_frames)   # concat actions
         return tuple([obs, act, state])
 
 
@@ -105,18 +111,18 @@ def random_split_traj(
     lengths: Sequence[int],
     generator: Optional[torch.Generator] = default_generator,
 ) -> List[TrajSubset]:
-    if sum(lengths) != len(dataset):  # type: ignore[arg-type]
+    if sum(lengths) != len(dataset):   # type: ignore[arg-type]
         raise ValueError(
             "Sum of input lengths does not equal the length of the input dataset!"
         )
 
     indices = randperm(sum(lengths), generator=generator).tolist()
-    print(
-        [
-            indices[offset - length : offset]
-            for offset, length in zip(_accumulate(lengths), lengths)
-        ]
-    )
+    # Per-split index lists, one entry per trajectory. Printing them dumps ~2000 integers on every
+    # dataset load, in a DAgger run that is once per generation round and once per training round,
+    # and it reliably buries the real error when something fails.
+    _split_sizes = [len(indices[offset - length: offset])
+                    for offset, length in zip(_accumulate(lengths), lengths)]
+    print(f"[split] {len(dataset)} trajectories -> splits of {_split_sizes}")
     return [
         TrajSubset(dataset, indices[offset - length : offset])
         for offset, length in zip(_accumulate(lengths), lengths)

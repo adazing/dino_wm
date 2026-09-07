@@ -1,4 +1,5 @@
-# Adapted from https://github.com/facebookresearch/ijepa/blob/main/src/models/vision_transformer.py 
+# Adapted from
+# https://github.com/facebookresearch/ijepa/blob/main/src/models/vision_transformer.py
 import numpy as np
 import torch.nn as nn
 
@@ -31,20 +32,20 @@ def get_1d_sincos_pos_embed_from_grid(emb_dim, pos):
     pos = pos.reshape(-1)   # (M,)
     out = np.einsum('m,d->md', pos, omega)   # (M, D/2), outer product
 
-    emb_sin = np.sin(out)  # (M, D/2)
-    emb_cos = np.cos(out)  # (M, D/2)
+    emb_sin = np.sin(out)   # (M, D/2)
+    emb_cos = np.cos(out)   # (M, D/2)
 
-    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)   # (M, D)
     return emb
 
 class ProprioceptiveEmbedding(nn.Module):
     def __init__(
         self,
-        num_frames=16, # horizon
+        num_frames=16,   # horizon
         tubelet_size=1,
-        in_chans=8, # action_dim
-        emb_dim=384, # output_dim
-        use_3d_pos=False # always False for now
+        in_chans=8,   # action_dim
+        emb_dim=384,   # output_dim
+        use_3d_pos=False   # always False for now
     ):
         super().__init__()
         print(f'using 3d prop position {use_3d_pos=}')
@@ -62,7 +63,7 @@ class ProprioceptiveEmbedding(nn.Module):
             stride=tubelet_size)
 
     def forward(self, x):
-        # x: proprioceptive vectors of shape [B T D]
+        # x, proprioceptive vectors of shape [B T D]
         x = x.permute(0, 2, 1)
         x = self.patch_embed(x)
         x = x.permute(0, 2, 1)

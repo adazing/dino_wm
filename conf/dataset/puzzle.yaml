@@ -1,0 +1,9 @@
+# Puzzle demos produced by tools/gen_puzzle_dset.py.
+_target_: "datasets.puzzle_dset.load_puzzle_slice_train_val"
+n_rollout: null
+normalize_action: ${normalize_action}
+data_path: /nas/ada/dev/dino/data/puzzle_3x3_noisy
+split_ratio: 0.9
+transform:
+  _target_: "datasets.img_transforms.default_transform"
+  img_size: ${img_size}

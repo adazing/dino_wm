@@ -8,17 +8,13 @@ kwargs:
 act_dim: 2
 goal_dim: 0
 views: 1
+# pusht exposes a built-in task goal + coverage, final_coverage in step info, so a 'task' eval
+# pass reports coverage/reward (unless goal_source=random_state).
+has_coverage: true
 
-dataset:
-  _target_: "datasets.pusht_dset.load_pusht_slice_train_val"
-  with_velocity: true
-  n_rollout: null
-  normalize_action: ${normalize_action}
-  data_path: ${oc.env:DATASET_DIR}/pusht_noise
-  split_ratio: 0.9
-  transform:
-    _target_: "datasets.img_transforms.default_transform"
-    img_size: ${img_size}
+# The DATASET is chosen separately via the `dataset` config group (dataset=pusht | pusht_noise),
+# so the same pusht env can train/eval on either.
+dataset: ${dataset}
 
 decoder_path: null
 num_workers: 16

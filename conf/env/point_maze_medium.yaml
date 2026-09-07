@@ -1,0 +1,23 @@
+# d4rl maze2d MEDIUM maze, a force-controlled point mass in a fixed 8x8 corridor layout.
+#   ########  open cells are rows/cols 1..6, so world coordinates span ~[0.5, 6.5]
+#   #OO#OOO#  x in [0.35, 6.25], y in [0.35, 6.25].
+#   #OO#OOO#  maze is FIXED (one layout), so update_env is a no-op, unlike wall, which
+#   #O#OO#O#  carries a per-trajectory door/wall location. That makes DAgger relabelling
+#   #OOO#OG#  simpler here, there is no layout to replay alongside each (init, goal) pair.
+name: point_maze_medium
+args: []
+kwargs: {}
+
+# action / goal / view dims for the BC policy
+act_dim: 2
+goal_dim: 0
+views: 1
+# No coverage metric, success is a position threshold, so a 'task' eval pass would degenerate into
+# a goal pass.
+has_coverage: false
+
+# DATASET chosen via the `dataset` group, use dataset=point_maze_medium with this env.
+dataset: ${dataset}
+
+decoder_path: null
+num_workers: 16

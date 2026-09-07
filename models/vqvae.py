@@ -7,20 +7,8 @@ sys.path.append('..')
 import distributed_fn as dist_fn
 from einops import rearrange
 
+#============================================================================
 # Copyright 2018 The Sonnet Authors. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or  implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ============================================================================
 
 
 # Borrowed from https://github.com/deepmind/sonnet and ported it to PyTorch
@@ -200,7 +188,7 @@ class VQVAE(nn.Module):
             input: (b, t, num_patches, emb_dim)
         '''
         num_patches = input.shape[2]
-        num_side_patches = int(num_patches ** 0.5)    
+        num_side_patches = int(num_patches ** 0.5)
         input = rearrange(input, "b t (h w) e -> (b t) h w e", h=num_side_patches, w=num_side_patches)
 
         if self.quantize:
@@ -211,14 +199,14 @@ class VQVAE(nn.Module):
         quant_b = quant_b.permute(0, 3, 1, 2)
         diff_b = diff_b.unsqueeze(0)
         dec = self.decode(quant_b)
-        return dec, diff_b # diff is 0 if no quantization
+        return dec, diff_b   # diff is 0 if no quantization
 
     def decode(self, quant_b):
-        upsample_b = self.upsample_b(quant_b) 
-        dec = self.dec(upsample_b) # quant: (128, 64, 64)
+        upsample_b = self.upsample_b(quant_b)
+        dec = self.dec(upsample_b)   # quant, (128, 64, 64)
         return dec
 
-    def decode_code(self, code_b): # not used (only used in sample.py in original repo)
+    def decode_code(self, code_b):   # not used, only used in sample.py in original repo
         quant_b = self.quantize_b.embed_code(code_b)
         quant_b = quant_b.permute(0, 3, 1, 2)
         dec = self.decode(quant_b)

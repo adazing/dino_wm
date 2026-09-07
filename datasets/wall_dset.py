@@ -20,12 +20,16 @@ class WallDataset(TrajDataset):
         transform: Optional[Callable] = None,
         normalize_action: bool = False,
         action_scale=1.0,
-    ):  
+        states_file: str = "states.pth",
+    ):
         self.data_path = Path(data_path)
         self.transform = transform
         self.normalize_action = normalize_action
         print("Loading wall dataset...")
-        states = torch.load(self.data_path / "states.pth")
+        # states_file selects which position array to use. while the images were rendered through
+        # envs/wall.py's location + action * 2.
+        #   states_true.pth  written by tools/recover_states.py, the env rollout of the same actions.
+        states = torch.load(self.data_path / states_file)
         self.states = states
         self.proprios = self.states.clone()
         self.actions = torch.load(self.data_path / "actions.pth")
@@ -68,6 +72,20 @@ class WallDataset(TrajDataset):
         self.actions = (self.actions - self.action_mean) / self.action_std
         self.proprios = (self.proprios - self.proprio_mean) / self.proprio_std
 
+        # surface the action-normalization stats, confirm the BC/generation dataset normalizes
+        # actions the same way the WM was trained with, compare to the hardcoded ACTION_MEAN/STD
+        # or to the WM's saved stats.
+        if normalize_action:
+            _match = (torch.allclose(self.action_mean, ACTION_MEAN, atol=1e-3)
+                      and torch.allclose(self.action_std, ACTION_STD, atol=1e-3))
+            print(f"[wall] normalize_action=True: computed action_mean={self.action_mean.tolist()}, "
+                  f"action_std={self.action_std.tolist()} | hardcoded ACTION_MEAN={ACTION_MEAN.tolist()}, "
+                  f"ACTION_STD={ACTION_STD.tolist()} | match={_match}"
+                  + ("" if _match else "  <-- MISMATCH: verify the WM used these same stats"))
+        else:
+            print(f"[wall] normalize_action=False: actions kept in raw scale "
+                  f"(action_mean=0, action_std=1); {len(self.states)} rollouts.")
+
     def get_seq_length(self, idx):
         return self.traj_len
 
@@ -87,7 +105,10 @@ class WallDataset(TrajDataset):
         door_location = self.door_locations[idx, frames]
         wall_location = self.wall_locations[idx, frames]
 
-        image = image[frames] / 255 
+        # .float() before the divide (see point_maze_dset), without it the stored dtype is kept so
+        # a float64 episode reaches DINO as double and its patch-embed conv raises "Input type
+        # (double) and bias type (float) should be the same".
+        image = image[frames].float() / 255
         if self.transform:
             image = self.transform(image)
         obs = {"visual": image,"proprio": proprio}
@@ -98,7 +119,7 @@ class WallDataset(TrajDataset):
 
     def __len__(self):
         return self.states.shape[0] if not self.n_rollout else self.n_rollout
-    
+
     def preprocess_imgs(self, imgs):
         if isinstance(imgs, np.ndarray):
             raise NotImplementedError
@@ -115,18 +136,20 @@ def load_wall_slice_train_val(
     num_hist=0,
     num_pred=0,
     frameskip=0,
-):  
+    states_file="states.pth",
+):
     if split_mode == "random":
         dset = WallDataset(
             n_rollout=n_rollout,
             transform=transform,
             data_path=data_path,
             normalize_action=normalize_action,
+            states_file=states_file,
         )
         dset_train, dset_val, train_slices, val_slices = get_train_val_sliced(
-            traj_dataset=dset, 
-            train_fraction=split_ratio, 
-            num_frames=num_hist + num_pred, 
+            traj_dataset=dset,
+            train_fraction=split_ratio,
+            num_frames=num_hist + num_pred,
             frameskip=frameskip
         )
     elif split_mode == "folder":
@@ -135,12 +158,14 @@ def load_wall_slice_train_val(
             transform=transform,
             data_path=data_path + "/train",
             normalize_action=normalize_action,
+            states_file=states_file,
         )
         dset_val = WallDataset(
             n_rollout=n_rollout,
             transform=transform,
             data_path=data_path + "/val",
             normalize_action=normalize_action,
+            states_file=states_file,
         )
         num_frames = num_hist + num_pred
         train_slices = TrajSlicerDataset(dset_train, num_frames, frameskip)

@@ -1,4 +1,6 @@
 import os
+# MuJoCo defaults to the GLFW backend, which needs an X display and fails on a headless box.
+os.environ.setdefault("MUJOCO_GL", "egl")
 import gym
 import json
 import hydra
@@ -16,8 +18,8 @@ from einops import rearrange
 from omegaconf import OmegaConf, open_dict
 
 from env.venv import SubprocVectorEnv
-from custom_resolvers import replace_slash
-from preprocessor import Preprocessor
+from utils.custom_resolvers import replace_slash
+from utils.preprocessor import Preprocessor
 from planning.evaluator import PlanEvaluator
 from utils import cfg_to_dict, seed
 
@@ -57,7 +59,7 @@ def launch_plan_jobs(
                 }
             )
             cfg_dict["saved_folder"] = subdir_path
-            cfg_dict["wandb_logging"] = False  # don't init wandb
+            cfg_dict["wandb_logging"] = False   # don't init wandb
             job = executor.submit(planning_main_in_dir, subdir_path, cfg_dict)
             jobs.append((epoch, subdir_name, job))
             print(
@@ -103,7 +105,7 @@ def build_plan_cfg_dicts(
         override_args.pop("planner")
         cfg = OmegaConf.merge(cfg, OmegaConf.create(override_args))
         cfg_dict = OmegaConf.to_container(cfg)
-        cfg_dict["planner"]["horizon"] = cfg_dict["goal_H"]  # assume planning horizon equals to goal horizon
+        cfg_dict["planner"]["horizon"] = cfg_dict["goal_H"]   # assume planning horizon equals to goal horizon
         cfg_dicts.append(cfg_dict)
     return cfg_dicts
 
@@ -128,8 +130,9 @@ class PlanWorkspace:
         self.wandb_run = wandb_run
         self.device = next(wm.parameters()).device
 
-        # have different seeds for each planning instances
-        self.eval_seed = [cfg_dict["seed"] * n + 1 for n in range(cfg_dict["n_evals"])]
+        # One seed per parallel planning instance, a CONTIGUOUS block, base + n.
+        _seed_base = int(cfg_dict.get("eval_seed_base", None) or cfg_dict["seed"])
+        self.eval_seed = [_seed_base + n for n in range(cfg_dict["n_evals"])]
         print("eval_seed: ", self.eval_seed)
         self.n_evals = cfg_dict["n_evals"]
         self.goal_source = cfg_dict["goal_source"]
@@ -174,11 +177,11 @@ class PlanWorkspace:
         ):
             self.wandb_run = DummyWandbRun()
 
-        self.log_filename = "logs.json"  # planner and final eval logs are dumped here
+        self.log_filename = "logs.json"   # planner and final eval logs are dumped here
         self.planner = hydra.utils.instantiate(
             self.cfg_dict["planner"],
             wm=self.wm,
-            env=self.env,  # only for mpc
+            env=self.env,   # only for mpc
             action_dim=self.action_dim,
             objective_fn=objective_fn,
             preprocessor=self.data_preprocessor,
@@ -187,13 +190,14 @@ class PlanWorkspace:
             log_filename=self.log_filename,
         )
 
-        # optional: assume planning horizon equals to goal horizon
+        # optional, assume planning horizon equals to goal horizon (fixed-horizon mode).
         from planning.mpc import MPCPlanner
-        if isinstance(self.planner, MPCPlanner):
-            self.planner.sub_planner.horizon = cfg_dict["goal_H"]
-            self.planner.n_taken_actions = cfg_dict["goal_H"]
-        else:
-            self.planner.horizon = cfg_dict["goal_H"]
+        if not cfg_dict.get("plan_to_end", False):
+            if isinstance(self.planner, MPCPlanner):
+                self.planner.sub_planner.horizon = cfg_dict["goal_H"]
+                self.planner.n_taken_actions = cfg_dict["goal_H"]
+            else:
+                self.planner.horizon = cfg_dict["goal_H"]
 
         self.dump_targets()
 
@@ -201,7 +205,7 @@ class PlanWorkspace:
         states = []
         actions = []
         observations = []
-        
+
         if self.goal_source == "random_state":
             # update env config from val trajs
             observations, states, actions, env_info = (
@@ -213,7 +217,7 @@ class PlanWorkspace:
             rand_init_state, rand_goal_state = self.env.sample_random_init_goal_states(
                 self.eval_seed
             )
-            if self.env_name == "deformable_env": # take rand init state from dset for deformable envs
+            if self.env_name == "deformable_env":   # take rand init state from dset for deformable envs
                 rand_init_state = np.array([x[0] for x in states])
 
             obs_0, state_0 = self.env.prepare(self.eval_seed, rand_init_state)
@@ -226,13 +230,34 @@ class PlanWorkspace:
 
             self.obs_0 = obs_0
             self.obs_g = obs_g
-            self.state_0 = rand_init_state  # (b, d)
+            self.state_0 = rand_init_state   # (b, d)
             self.state_g = rand_goal_state
             self.gt_actions = None
+        elif self.goal_source == "provided":
+            # init/goal states supplied by the caller, used by generate_planned_trajectories.py
+            # for controlled selection / plan_to_end.
+            env_info = self.cfg_dict["env_info"]
+            self.env.update_env(env_info)
+            init_state = np.asarray(self.cfg_dict["init_states"])
+            goal_state = np.asarray(self.cfg_dict["goal_states"])
+            obs_0, state_0 = self.env.prepare(self.eval_seed, init_state)
+            obs_g, state_g = self.env.prepare(self.eval_seed, goal_state)
+            for k in obs_0.keys():
+                obs_0[k] = np.expand_dims(obs_0[k], axis=1)
+                obs_g[k] = np.expand_dims(obs_g[k], axis=1)
+            self.obs_0 = obs_0
+            self.obs_g = obs_g
+            self.state_0 = init_state   # (b, d)
+            self.state_g = goal_state
+            self.gt_actions = None
         else:
-            # update env config from val trajs
+            # update env config from val trajs, or specific traj_ids/offsets if provided
             observations, states, actions, env_info = (
-                self.sample_traj_segment_from_dset(traj_len=self.frameskip * self.goal_H + 1)
+                self.sample_traj_segment_from_dset(
+                    traj_len=self.frameskip * self.goal_H + 1,
+                    traj_ids=self.cfg_dict.get("traj_ids"),
+                    offsets=self.cfg_dict.get("offsets"),
+                )
             )
             self.env.update_env(env_info)
 
@@ -256,40 +281,39 @@ class PlanWorkspace:
                 key: np.expand_dims(arr[:, -1], axis=1)
                 for key, arr in rollout_obses.items()
             }
-            self.state_0 = init_state  # (b, d)
-            self.state_g = rollout_states[:, -1]  # (b, d)
+            self.state_0 = init_state   # (b, d)
+            self.state_g = rollout_states[:, -1]   # (b, d)
             self.gt_actions = wm_actions
 
-    def sample_traj_segment_from_dset(self, traj_len):
+    def sample_traj_segment_from_dset(self, traj_len, traj_ids=None, offsets=None):
         states = []
         actions = []
         observations = []
         env_info = []
 
-        # Check if any trajectory is long enough
-        valid_traj = [
-            self.dset[i][0]["visual"].shape[0]
-            for i in range(len(self.dset))
-            if self.dset[i][0]["visual"].shape[0] >= traj_len
-        ]
-        if len(valid_traj) == 0:
+        # Check if any trajectory is long enough.
+        if not any(self.dset.get_seq_length(i) >= traj_len for i in range(len(self.dset))):
             raise ValueError("No trajectory in the dataset is long enough.")
 
-        # sample init_states from dset
+        # sample init_states from dset. Pick the (traj, offset) using get_seq_length (cached int),
+        # then decode only the [offset, offset+traj_len) window via get_frames, not the whole
+        # video.
         for i in range(self.n_evals):
-            max_offset = -1
-            while max_offset < 0:  # filter out traj that are not long enough
-                traj_id = random.randint(0, len(self.dset) - 1)
-                obs, act, state, e_info = self.dset[traj_id]
-                max_offset = obs["visual"].shape[0] - traj_len
+            if traj_ids is not None:
+                # caller-specified trajectory (and optionally offset)
+                traj_id = traj_ids[i]
+                max_offset = self.dset.get_seq_length(traj_id) - traj_len
+                offset = offsets[i] if offsets is not None else random.randint(0, max_offset)
+            else:
+                max_offset = -1
+                while max_offset < 0:   # find a trajectory long enough (no decode)
+                    traj_id = random.randint(0, len(self.dset) - 1)
+                    max_offset = self.dset.get_seq_length(traj_id) - traj_len
+                offset = random.randint(0, max_offset)
+            obs, act, state, e_info = self.dset.get_frames(
+                traj_id, range(offset, offset + traj_len))
             state = state.numpy()
-            offset = random.randint(0, max_offset)
-            obs = {
-                key: arr[offset : offset + traj_len]
-                for key, arr in obs.items()
-            }
-            state = state[offset : offset + traj_len]
-            act = act[offset : offset + self.frameskip * self.goal_H]
+            act = act[: self.frameskip * self.goal_H]
             actions.append(act)
             states.append(state)
             observations.append(obs)
@@ -352,7 +376,9 @@ class PlanWorkspace:
 
 def load_ckpt(snapshot_path, device):
     with snapshot_path.open("rb") as f:
-        payload = torch.load(f, map_location=device)
+        # weights_only=False, the checkpoint pickles full model objects (ViTPredictor
+        # DinoV2Encoder...), not just tensors.
+        payload = torch.load(f, map_location=device, weights_only=False)
     loaded_keys = []
     result = {}
     for k, v in payload.items():
@@ -380,16 +406,22 @@ def load_model(model_ckpt, train_cfg, num_action_repeat, device):
         base_path = os.path.dirname(os.path.abspath(__file__))
         if train_cfg.env.decoder_path is not None:
             decoder_path = os.path.join(base_path, train_cfg.env.decoder_path)
-            ckpt = torch.load(decoder_path)
+            ckpt = torch.load(decoder_path, weights_only=False)
             if isinstance(ckpt, dict):
                 result["decoder"] = ckpt["decoder"]
             else:
-                result["decoder"] = torch.load(decoder_path)
+                result["decoder"] = ckpt
         else:
-            raise ValueError(
-                "Decoder path not found in model checkpoint \
-                                and is not provided in config"
+            # figures/videos, planning/evaluator.py guards on `self.wm.decoder is not None` and
+            # dream-mode visuals, generate_planned_trajectories.py guards the same way.
+            print(
+                "[load_model] WARNING: the WM's saved config says has_decoder=true, but the "
+                "checkpoint has no 'decoder' and env.decoder_path is null (most likely the run "
+                "used train_decoder=false, so the decoder was never saved). Continuing with "
+                "decoder=None -- planning/generation are unaffected; only saved figures/videos "
+                "and dream-mode images are unavailable."
             )
+            result["decoder"] = None
     elif not train_cfg.has_decoder:
         result["decoder"] = None
 
@@ -458,25 +490,40 @@ def planning_main(cfg_dict):
     )
     model = load_model(model_ckpt, model_cfg, num_action_repeat, device=device)
 
+    # Optional per-run overrides of the env kwargs the WM saved at training time.
+    env_kwargs = OmegaConf.to_container(model_cfg.env.kwargs, resolve=True)
+    if cfg_dict.get("env_kwargs"):
+        env_kwargs.update(dict(cfg_dict["env_kwargs"]))
+        log.info(f"Env kwargs overridden with {dict(cfg_dict['env_kwargs'])}")
+
+    # Plain copies, under start_method=spawn the env_fn closure is cloudpickled to the child.
+    _env_name = str(model_cfg.env.name)
+    _env_args = list(model_cfg.env.args or [])
+    _n_envs = int(cfg_dict["n_evals"])
+    # serial_env, no subprocesses at all. env_start_method, 'fork' (default) | 'spawn' |
+    # 'forkserver'.
+    _serial = bool(cfg_dict.get("serial_env", False))
+    _start_method = cfg_dict.get("env_start_method", None)
     # use dummy vector env for wall and deformable envs
-    if model_cfg.env.name == "wall" or model_cfg.env.name == "deformable_env":
+    if _serial or _env_name == "wall" or _env_name == "deformable_env":
         from env.serial_vector_env import SerialVectorEnv
         env = SerialVectorEnv(
             [
                 gym.make(
-                    model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
+                    _env_name, *_env_args, **env_kwargs
                 )
-                for _ in range(cfg_dict["n_evals"])
+                for _ in range(_n_envs)
             ]
         )
     else:
         env = SubprocVectorEnv(
             [
                 lambda: gym.make(
-                    model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
+                    _env_name, *_env_args, **env_kwargs
                 )
-                for _ in range(cfg_dict["n_evals"])
-            ]
+                for _ in range(_n_envs)
+            ],
+            start_method=_start_method,
         )
 
     plan_workspace = PlanWorkspace(

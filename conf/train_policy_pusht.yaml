@@ -1,0 +1,158 @@
+defaults:
+  - _self_
+  - env_vars: env_vars
+  - env: pusht
+  # dataset for the env, pusht | pusht_noise | wall.
+  - dataset: pusht
+  - encoder: dino_avg_pool
+  - policy: vqbet
+  - override hydra/launcher: submitit_slurm
+
+# Which trajectories the policy trains on.
+#   original  demonstrations only
+#   planned   world-model planned trajectories only
+#   both      concatenated, weighted by window count rather than 50/50
+data_source: planned
+# Planned trajectories produced by generate_planned_trajectories.py. Either a single .pth
+# file or a shard directory when generated with shard_every > 0.
+planned_data_path: /nas/ada/dev/dino_wm/plan_outputs/20260721002433_pusht_gH5/planned_pusht
+# Train only on planned trajectories that reached their goal.
+planned_only_successes: false   # keep only trajectories that reached the goal (needs 'successes' metadata)
+planned_max_trajectories: 100   # cap how many planned trajectories to use, after filtering. Null = all
+# WHICH planned trajectories the cap keeps once the pool exceeds it.
+planned_selection: first
+planned_selection_seed: 0
+# --- original-data subset (data_source original/both) --------------------------------------
+# original_max_trajectories, how many original trajectories/segments to use.
+original_max_trajectories: null
+original_segment_length: null
+original_subset_seed: null
+
+# condition the policy on a goal image.
+goal_conditional: true
+# goal source when goal_conditional=true
+#   future_conditional=false -> the trajectory's final frame (hindsight endpoint)
+#   future_conditional=true  -> a frame/clip sampled from ahead in the trajectory
+future_conditional: true
+min_future_sep: ${action_window_size}   # min gap between window and the sampled goal
+future_seq_len: 1   # number of future frames forming the goal
+only_sample_tail: false   # if true, always use the last future_seq_len frames
+
+# dataset / windows
+img_size: 224
+normalize_action: true
+num_hist: 1   # only used by the env dataset loader signature
+num_pred: 1
+frameskip: 1   # BC policy uses per-step actions
+window_size: 5   # obs history length (obs_horizon)
+action_window_size: 5
+train_fraction: 0.95
+seed: 42
+# Make world-model rollouts inside the planner reproducible. Slower.
+deterministic: false
+# precompute_embeddings true, encode the whole dataset once into RAM (fast, but memory grows with
+# dataset size).
+precompute_embeddings: true
+embed_device: cpu   # where precomputed embeddings are cached (precompute only)
+
+# optim / training
+optim:
+  lr: 5.5e-5
+  weight_decay: 2e-4
+  betas: [0.9, 0.999]
+batch_size: 16
+epochs: 5000
+num_workers: 8
+save_every: 50
+eval_freq: 10   # validation action-loss every N epochs
+
+# Start from a prior train_policy.py checkpoint (a checkpoints/model_*.pt).
+checkpoint: /nas/ada/dev/dino_wm/policy_outputs/20260726004414_pusht_dino_avg_pool_vqbet_both_gcTrue/checkpoints/model_1050.pt
+# resume, true -> RESTART the same run on the SAME data, load model + optimizer + epoch and
+# continue the same wandb run, pick up where it left off.
+#   false -> FINETUNE on NEW data, load model WEIGHTS only.
+resume: false
+
+# closed-loop env eval.
+eval_on_env: true
+# DEFAULT env-eval init/goal source when a pass omits goal_source (per-pass goal_source
+# overrides).
+#   train | valid       -> the MAIN (trained-on) dataset.
+#   eval_train | eval_valid -> the SEPARATE eval_task_dataset's own train | valid split.
+#   random_state        -> init/goal sampled from the env.
+eval_goal_source: valid
+# --- alternate dataset for 'task' passes ONLY, goal passes always use the main env dataset ------
+# eval_task_dataset picks where 'task' passes draw init/goal + goal-images from.
+#   null           -> reuse the main env dataset, loaded ONCE, the default.
+#   a group NAME   -> a config from conf/dataset/, pusht | pusht_noise | wall.
+eval_task_dataset: null
+eval_on_env_freq: 50
+n_env_evals: 100   # must be a multiple of n_envs
+n_envs: 10
+# Run every env in this process instead of forked subprocesses. Slower but avoids EGL failures under fork.
+serial_env: false
+# How env worker processes are created.
+#   null        fork, the Python default
+#   fork        copies this process, fast, but EGL state does not survive the copy
+#   spawn       fresh interpreter per worker, needed for MuJoCo envs that render
+#   forkserver  children fork from one clean server process
+env_start_method: null
+
+eval_horizon: 300   # default env steps/episode (pusht max_episode_steps=300). Used only when eval_passes is empty
+# Where a demo-goal eval pass gets its goal image.
+#   env      drawn by the same renderer that draws the observations
+#   dataset  stored frame
+eval_goal_render: env
+# eval goal = this many env-frames ahead of the start.
+eval_goal_offset: null
+# Short-goal (type, goal) passes start at a RANDOM offset into each trajectory with the goal
+# goal_offset frames ahead of it, like dino-wm's sampling / BC's windowed training, instead of
+# always frame 0 -> tests diverse start states, not just the first segment.
+eval_goal_random_start: true
+# Eval passes, each runs a full closed-loop eval, logged under "<name>/..." in wandb.
+#   type, goal -> condition on the frame goal_offset ahead.
+#   type, task -> condition on the FINAL frame.
+#   train       -> the EXACT trajectories BC trained on (MAIN dataset's data_source split.
+#   valid       -> the MAIN env dataset's held-out valid split, real demos never trained on.
+#   eval_train  -> the SEPARATE eval_task_dataset's own TRAIN split (needs eval_task_dataset.
+#   eval_valid  -> the SEPARATE eval_task_dataset's own VALID split (needs eval_task_dataset.
+#   random_state-> init/goal SAMPLED FROM THE ENV.
+eval_passes:
+  # short-goal on held-out demos, goal 25 frames ahead, long horizon so a slightly-off rollout has
+  # room to recover.
+  - {name: goal25_valid,   type: goal, goal_offset: 25, horizon: 300, goal_source: valid}
+  # short-goal on the EXACT trajectories BC trained on, same inits it saw.
+  - {name: goal25_train,  type: goal, goal_offset: 25, horizon: 300, goal_source: train}
+  # short-goal on the SEPARATE eval_task_dataset's splits (needs eval_task_dataset set), - {name,
+  # goal25_eval_valid, type, goal, goal_offset, 25, horizon, 300, goal_source, eval_valid} -
+  # {name, goal25_eval_train, type, goal, goal_offset, 25, horizon, 300, goal_source, eval_train}
+  # env-sampled random init/goal, scored by success/distance.
+  - {name: task, type: task, horizon: 300, goal_source: valid}
+# rollout videos, a RANDOM subset (size n_eval_videos) across all eval episodes, re-sampled each
+# epoch so the filmed scenes vary over time.
+save_eval_video: true
+n_eval_videos: 10   # how many random episodes to record per eval (<= n_env_evals)
+# true -> film the SAME random episodes every eval, watch fixed scenes improve over epochs false
+# -> a fresh random set of episodes each eval (variety)
+eval_video_fixed: false
+eval_video_fps: 12
+
+wandb:
+  project: dino_wm_bc
+  entity: null
+  # Run identity in the wandb UI.
+  #   group  runs sharing a group collapse into one row. WITHIN a project only
+  name: null
+  group: null
+  job_type: null
+  tags: []
+wandb_logging: true
+experiment: ${policy._target_}_${data_source}
+
+hydra:
+  job:
+    chdir: true   # cd into the run dir, Hydra 1.2 defaults this to false. Without it
+                  # os.getcwd() stays the launch dir and outputs land in the base folder
+  run:
+    # descriptive, unique per-run dir.
+    dir: ./policy_outputs/${now:%Y%m%d%H%M%S}_${env.name}_${hydra:runtime.choices.encoder}_${hydra:runtime.choices.policy}_${data_source}_gc${goal_conditional}

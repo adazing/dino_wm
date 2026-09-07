@@ -6,4 +6,11 @@ var_scale: 1
 opt_steps: 30
 eval_every: 1
 
+# opt-in early-stop (both null = off -> run all opt_steps, unchanged default), stop_loss_thresh,
+# break when EVERY trajectory's best imagined objective <= this value (the WM thinks all plans
+# reached the goal).
+stop_loss_thresh: null
+patience: null
+min_delta: 0.00
+
 name: cem

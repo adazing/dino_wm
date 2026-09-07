@@ -1,0 +1,131 @@
+# Phase 1 WM-planned generation for the WALL env, seeded RANDOM init/goal pairs sampled from the
+# env itself, planned with the frozen WM, every action EXECUTED IN THE REAL ENV.
+#   goal_source  random_state
+#   planner      cem, open-loop, one search from the initial observation
+#   env          wall, taken from the world model's saved config via model_name
+defaults:
+  - _self_
+  - planner: cem
+  - override hydra/launcher: submitit_slurm
+
+hydra:
+  run:
+    dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_randgH${goal_H}
+  sweep:
+    dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_randgH${goal_H}
+    subdir: ${hydra.job.num}
+  launcher:
+    submitit_folder: ${hydra.sweep.dir}/.submitit/%j
+    nodes: 1
+    tasks_per_node: 1
+    cpus_per_task: 16
+    mem_gb: 256
+    gres: "gpu:h100:1"
+    qos: "explore"
+    timeout_min: 720
+
+# --- the frozen world model (REQUIRED) ------------------------------------------------------
+# The env (wall) comes from THIS run's saved config, so there is no env= to set here.
+ckpt_base_path: /nas/ada/dev/dino_wm
+model_name: 2026-08-14/13-07-36   # REQUIRED, e.g. 2026-07-13/23-54-17
+model_epoch: 89
+
+# --- Phase 1, random, env-sampled init/goal -------------------------------------------------
+# Where planning gets its init and goal pairs.
+#   dset           demo trajectory, goal frameskip * goal_H frames ahead
+#   random_state   sampled from the env itself with no reference to any demo
+#   random_action  random action sequence rolled out to define the goal
+#   valid          demo from the valid split
+#   train          demo from the train split
+#   file           read from goal_file_path
+goal_source: 'random_state'
+# Generation builds the env from the WORLD MODEL's saved config, not from conf/env/wall.yaml, so
+# env.kwargs there does not reach it.
+env_kwargs: {sample_padding: null}
+# Seeded and reproducible, PlanWorkspace derives per-episode seeds as seed*n+1 for n in
+# range(n_evals), and generate_planned_trajectories varies them per round (base_seed + r*1000).
+seed: 99
+# Make world-model rollouts inside the planner reproducible. Slower.
+deterministic: false   # true = reproducible WM rollouts inside CEM (slower)
+n_evals: 10   # episodes planned per round, batched through SerialVectorEnv
+# Run every env in this process instead of forked subprocesses. Slower but avoids EGL failures under fork.
+serial_env: false
+# How env worker processes are created.
+#   null        fork, the Python default
+#   fork        copies this process, fast, but EGL state does not survive the copy
+#   spawn       fresh interpreter per worker, needed for MuJoCo envs that render
+#   forkserver  children fork from one clean server process
+env_start_method: null
+
+goal_H: 5   # planning horizon in WM steps
+
+# Which optimiser searches for the action sequence. The group file holds the shared
+# settings, only genuine differences belong here.
+#   cem      open-loop cross-entropy method, one search from the initial observation
+#   mpc_cem  closed-loop, replans from the real state after each committed chunk
+#   gd       open-loop gradient descent
+#   mpc_gd   closed-loop gradient descent
+
+# Weight on the proprio term in loss_visual + alpha * loss_proprio.
+objective:
+  _target_: planning.objectives.create_objective_fn
+  alpha: 1
+  base: 2
+  mode: last
+
+# --- how much to generate -------------------------------------------------------------------
+# num_trajectories, an int -> exactly that many.
+num_trajectories: 500
+n_planning_rounds: 50   # only used when num_trajectories is null
+mpc_max_iter: 20   # fallback cap if planner.max_iter is left null
+
+# --- output ---------------------------------------------------------------------------------
+# Relative paths land inside the timestamped Hydra run dir, so runs never mix.
+planned_out_path: ./planned_wall
+# Flush a shard every N rounds instead of holding everything in RAM.
+shard_every: 10
+# Train only on planned trajectories that reached their goal.
+planned_only_successes: false
+# Roll the plan out in imagination instead of the real env. Must stay false to produce usable data.
+dream: false   # MUST stay false, true = imagined rollouts, no env.step
+
+# --- unused in random_state mode, no demo segments are read --------------------------------
+# Plan to the demo's final frame instead of a fixed goal_H ahead. Not compatible with provided_states_path.
+plan_to_end: false
+# Which split planning samples its init and goal pairs from.
+#   train       demos from the train split
+#   val         held-out demos never trained on
+#   both        train and val concatenated
+#   eval_pairs  reproduce the exact episodes the BC eval scores on
+source_split: train
+eval_split: valid
+source_max_trajectories: null
+original_max_trajectories: null
+original_segment_length: null
+original_subset_seed: null
+# How trajectories are drawn from the source split.
+#   sequential               in index order
+#   random                   uniform at random, no repeats
+#   random_with_replacement  independent draws, duplicates allowed
+sample_mode: random
+eval_seed: null
+n_eval_episodes: null
+eval_goal_offset: null
+probe_ckpt: null
+override_dataset_path: null
+n_plot_samples: 10
+debug_dset_init: False
+
+# --- logging --------------------------------------------------------------------------------
+wandb_logging: true
+wandb:
+  project: dino_wm_planning
+  entity: null
+  # Run identity in the wandb UI.
+  #   group  runs sharing a group collapse into one row. WITHIN a project only
+  name: null
+  group: null
+  job_type: null
+  tags: []
+save_figure_every: 0   # env-vs-imagined.png every Nth round (0 = never)
+save_video_every: 0   # rollout.mp4 every Nth round (0 = never). Large

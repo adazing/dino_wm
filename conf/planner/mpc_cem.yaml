@@ -1,5 +1,5 @@
 _target_: planning.mpc.MPCPlanner
-max_iter: null # unlimited if null
+max_iter: null   # unlimited if null
 n_taken_actions: 5
 sub_planner:
   target: planning.cem.CEMPlanner
@@ -9,5 +9,9 @@ sub_planner:
   var_scale: 1
   opt_steps: 30
   eval_every: 1
+  # opt-in early-stop for the inner CEM (both null = off).
+  stop_loss_thresh: null
+  patience: null
+  min_delta: 0.0
 
 name: mpc_cem

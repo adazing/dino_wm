@@ -1,0 +1,12 @@
+# DynaMo "pusht-noise" demos.
+_target_: "datasets.pusht_dset.load_pusht_slice_train_val"
+with_velocity: true
+n_rollout: null
+normalize_action: ${normalize_action}
+relative: true   # OUTPUT relative actions, the env is relative. Already relative on disk
+action_scale: 100.0   # env target = agent_pos + action*action_scale
+data_path: /nas/ada/dev/dino/data/pusht_noise
+split_ratio: 0.9
+transform:
+  _target_: "datasets.img_transforms.default_transform"
+  img_size: ${img_size}

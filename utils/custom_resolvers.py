@@ -14,4 +14,3 @@ OmegaConf.register_new_resolver("replace_slash", replace_slash)
 
 if __name__ == "__main__":
     register_resolvers()
-

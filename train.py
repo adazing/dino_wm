@@ -40,7 +40,7 @@ class Trainer:
             log.info(" Multirun setup begin...")
             log.info(f"SLURM_JOB_NODELIST={os.environ['SLURM_JOB_NODELIST']}")
             log.info(f"DEBUGVAR={os.environ['DEBUGVAR']}")
-            # ==== init ddp process group ====
+            #==== init ddp process group ====
             os.environ["RANK"] = os.environ["SLURM_PROCID"]
             os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
             os.environ["LOCAL_RANK"] = os.environ["SLURM_LOCALID"]
@@ -48,14 +48,14 @@ class Trainer:
                 dist.init_process_group(
                     backend="nccl",
                     init_method="env://",
-                    timeout=timedelta(minutes=5),  # Set a 5-minute timeout
+                    timeout=timedelta(minutes=5),   # Set a 5-minute timeout
                 )
                 log.info("Multirun setup completed.")
             except Exception as e:
                 log.error(f"DDP setup failed: {e}")
                 raise
             torch.distributed.barrier()
-            # # ==== /init ddp process group ====
+            ## ==== /init ddp process group ====
 
         self.accelerator = Accelerator(log_with="wandb")
         log.info(
@@ -111,6 +111,17 @@ class Trainer:
                 f.write(OmegaConf.to_yaml(cfg, resolve=True))
 
         seed(cfg.training.seed)
+        # env and dataset are chosen independently (dataset config group), warn on an obvious
+        # mismatch (e.g.
+        _ds_target = str(OmegaConf.select(self.cfg, "env.dataset._target_") or "")
+        if self.cfg.env.name == "wall" and "wall" not in _ds_target:
+            log.warning(f"env=wall but dataset loader is {_ds_target!r} -- set dataset=wall?")
+        elif self.cfg.env.name == "pusht" and "pusht" not in _ds_target:
+            log.warning(f"env=pusht but dataset loader is {_ds_target!r} -- set dataset=pusht/pusht_noise?")
+        elif self.cfg.env.name == "puzzle" and "puzzle" not in _ds_target:
+            log.warning(f"env=puzzle but dataset loader is {_ds_target!r} -- set dataset=puzzle?")
+        elif self.cfg.env.name == "point_maze" and "point_maze" not in _ds_target:
+            log.warning(f"env=point_maze but dataset loader is {_ds_target!r} -- set dataset=point_maze?")
         log.info(f"Loading dataset from {self.cfg.env.dataset.data_path} ...")
         self.datasets, traj_dsets = hydra.utils.call(
             self.cfg.env.dataset,
@@ -126,7 +137,7 @@ class Trainer:
             x: torch.utils.data.DataLoader(
                 self.datasets[x],
                 batch_size=self.cfg.gpu_batch_size,
-                shuffle=False, # already shuffled in TrajSlicerDataset
+                shuffle=False,   # already shuffled in TrajSlicerDataset
                 num_workers=self.cfg.env.num_workers,
                 collate_fn=None,
             )
@@ -164,7 +175,9 @@ class Trainer:
             else []
         )
         self._keys_to_save += (
-            ["decoder", "decoder_optimizer"] if self.train_decoder else []
+            # also require has_decoder, with has_decoder=false there is no decoder_optimizer, so
+            # saving it would KeyError.
+            ["decoder", "decoder_optimizer"] if (self.train_decoder and self.cfg.has_decoder) else []
         )
         self._keys_to_save += ["action_encoder", "proprio_encoder"]
 
@@ -240,16 +253,27 @@ class Trainer:
             self.wandb_run.watch(self.action_encoder)
             self.wandb_run.watch(self.proprio_encoder)
 
-        # initialize predictor
-        if self.encoder.latent_ndim == 1:  # if feature is 1D
+        # predictor token count. A pooled/1-token encoder (avg_pool, cls -> latent_ndim==1) is a
+        # single token.
+        if self.encoder.latent_ndim == 1:   # pooled / 1D feature
             num_patches = 1
+        elif "dino" in getattr(self.encoder, "name", ""):   # VWorldModel resizes dino to the 16x grid
+            num_patches = (self.cfg.img_size // 16) ** 2
         else:
-            decoder_scale = 16  # from vqvae
-            num_side_patches = self.cfg.img_size // decoder_scale
-            num_patches = num_side_patches**2
+            num_patches = getattr(self.encoder, "n_patches", (self.cfg.img_size // 16) ** 2)
 
         if self.cfg.concat_dim == 0:
             num_patches += 2
+
+        # A pooled encoder (1 token) has no spatial grid for the vqvae decoder to reconstruct
+        # from.
+        if self.cfg.has_decoder and self.encoder.latent_ndim == 1:
+            raise ValueError(
+                f"has_decoder=true is incompatible with a pooled/1-token encoder "
+                f"({self.cfg.encoder.get('_target_', '?')}, latent_ndim=1): the vqvae decoder "
+                f"reconstructs from a spatial patch grid. Train latent-only with has_decoder=false "
+                f"(planning/BC/generation don't need the decoder), or use a patch encoder "
+                f"(dino / *_patch) for image reconstruction.")
 
         if self.cfg.has_predictor:
             if self.predictor is None:
@@ -284,14 +308,18 @@ class Trainer:
                 else:
                     self.decoder = hydra.utils.instantiate(
                         self.cfg.decoder,
-                        emb_dim=self.encoder.emb_dim,  # 384
+                        emb_dim=self.encoder.emb_dim,   # 384
                     )
             if not self.train_decoder:
                 for param in self.decoder.parameters():
                     param.requires_grad = False
-        self.encoder, self.predictor, self.decoder = self.accelerator.prepare(
-            self.encoder, self.predictor, self.decoder
-        )
+        # prepare only the modules that exist, has_predictor=false / has_decoder=false leave them
+        # None (e.g.
+        self.encoder = self.accelerator.prepare(self.encoder)
+        if self.predictor is not None:
+            self.predictor = self.accelerator.prepare(self.predictor)
+        if self.decoder is not None:
+            self.decoder = self.accelerator.prepare(self.decoder)
         self.model = hydra.utils.instantiate(
             self.cfg.model,
             encoder=self.encoder,
@@ -368,7 +396,7 @@ class Trainer:
             )
             self.monitor_thread.start()
 
-        init_epoch = self.epoch + 1  # epoch starts from 1
+        init_epoch = self.epoch + 1   # epoch starts from 1
         for epoch in range(init_epoch, init_epoch + self.total_epochs):
             self.epoch = epoch
             self.accelerator.wait_for_everyone()
@@ -378,11 +406,11 @@ class Trainer:
             self.logs_flash(step=self.epoch)
             if self.epoch % self.cfg.training.save_every_x_epoch == 0:
                 ckpt_path, model_name, model_epoch = self.save_ckpt()
-                # main thread only: launch planning jobs on the saved ckpt
+                # main thread only, launch planning jobs on the saved ckpt
                 if (
                     self.cfg.plan_settings.plan_cfg_path is not None
                     and ckpt_path is not None
-                ):  # ckpt_path is only not None for main process
+                ):   # ckpt_path is only not None for main process
                     from plan import build_plan_cfg_dicts, launch_plan_jobs
 
                     cfg_dicts = build_plan_cfg_dicts(
@@ -444,7 +472,7 @@ class Trainer:
             tqdm(self.dataloaders["train"], desc=f"Epoch {self.epoch} Train")
         ):
             obs, act, state = data
-            plot = i == 0  # only plot from the first batch
+            plot = i == 0   # only plot from the first batch
             self.model.train()
             z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
                 obs, act
@@ -473,24 +501,21 @@ class Trainer:
             loss_components = {
                 key: value.mean().item() for key, value in loss_components.items()
             }
+            # latent prediction error (no decoder needed), logged for latent-only WMs too
+            if plot and self.cfg.has_predictor:
+                z_obs_out, z_act_out = self.model.separate_emb(z_out)
+                z_gt = self.model.encode_obs(obs)
+                z_tgt = slice_trajdict_with_t(z_gt, start_idx=self.model.num_pred)
+                err_logs = self.err_eval(z_obs_out, z_tgt)
+                err_logs = self.accelerator.gather_for_metrics(err_logs)
+                err_logs = {
+                    key: value.mean().item() for key, value in err_logs.items()
+                }
+                err_logs = {f"train_{k}": [v] for k, v in err_logs.items()}
+                self.logs_update(err_logs)
+
+            # image metrics + reconstruction plots (need the decoder)
             if self.cfg.has_decoder and plot:
-                # only eval images when plotting due to speed
-                if self.cfg.has_predictor:
-                    z_obs_out, z_act_out = self.model.separate_emb(z_out)
-                    z_gt = self.model.encode_obs(obs)
-                    z_tgt = slice_trajdict_with_t(z_gt, start_idx=self.model.num_pred)
-
-                    state_tgt = state[:, -self.model.num_hist :]  # (b, num_hist, dim)
-                    err_logs = self.err_eval(z_obs_out, z_tgt)
-
-                    err_logs = self.accelerator.gather_for_metrics(err_logs)
-                    err_logs = {
-                        key: value.mean().item() for key, value in err_logs.items()
-                    }
-                    err_logs = {f"train_{k}": [v] for k, v in err_logs.items()}
-
-                    self.logs_update(err_logs)
-
                 if visual_out is not None:
                     for t in range(
                         self.cfg.num_hist, self.cfg.num_hist + self.cfg.num_pred
@@ -569,24 +594,21 @@ class Trainer:
                 key: value.mean().item() for key, value in loss_components.items()
             }
 
+            # latent prediction error (no decoder needed), logged for latent-only WMs too
+            if plot and self.cfg.has_predictor:
+                z_obs_out, z_act_out = self.model.separate_emb(z_out)
+                z_gt = self.model.encode_obs(obs)
+                z_tgt = slice_trajdict_with_t(z_gt, start_idx=self.model.num_pred)
+                err_logs = self.err_eval(z_obs_out, z_tgt)
+                err_logs = self.accelerator.gather_for_metrics(err_logs)
+                err_logs = {
+                    key: value.mean().item() for key, value in err_logs.items()
+                }
+                err_logs = {f"val_{k}": [v] for k, v in err_logs.items()}
+                self.logs_update(err_logs)
+
+            # image metrics + reconstruction plots (need the decoder)
             if self.cfg.has_decoder and plot:
-                # only eval images when plotting due to speed
-                if self.cfg.has_predictor:
-                    z_obs_out, z_act_out = self.model.separate_emb(z_out)
-                    z_gt = self.model.encode_obs(obs)
-                    z_tgt = slice_trajdict_with_t(z_gt, start_idx=self.model.num_pred)
-
-                    state_tgt = state[:, -self.model.num_hist :]  # (b, num_hist, dim)
-                    err_logs = self.err_eval(z_obs_out, z_tgt)
-
-                    err_logs = self.accelerator.gather_for_metrics(err_logs)
-                    err_logs = {
-                        key: value.mean().item() for key, value in err_logs.items()
-                    }
-                    err_logs = {f"val_{k}": [v] for k, v in err_logs.items()}
-
-                    self.logs_update(err_logs)
-
                 if visual_out is not None:
                     for t in range(
                         self.cfg.num_hist, self.cfg.num_hist + self.cfg.num_pred
@@ -669,8 +691,8 @@ class Trainer:
 
             for k in obs.keys():
                 obs[k] = obs[k][
-                    start : 
-                    start + horizon * self.cfg.frameskip + 1 : 
+                    start :
+                    start + horizon * self.cfg.frameskip + 1 :
                     self.cfg.frameskip
                 ]
             act = act[start : start + horizon * self.cfg.frameskip]
@@ -689,7 +711,7 @@ class Trainer:
                 for k in obs.keys():
                     obs_0[k] = (
                         obs[k][:n_past].unsqueeze(0).to(self.device)
-                    )  # unsqueeze for batch, (b, t, c, h, w)
+                    )   # unsqueeze for batch, b, t, c, h, w
 
                 z_obses, z = self.model.rollout(obs_0, actions)
                 z_obs_last = slice_trajdict_with_t(z_obses, start_idx=-1, end_idx=None)
@@ -808,7 +830,7 @@ class Trainer:
             img_name,
             nrow=num_columns,
             normalize=True,
-            value_range=(0, 1),  # visuals are in [0, 1]
+            value_range=(0, 1),   # visuals are in [0, 1]
         )
 
 
