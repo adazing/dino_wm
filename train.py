@@ -1,4 +1,6 @@
 import os
+import json
+import zlib
 import time
 import hydra
 import torch
@@ -30,8 +32,14 @@ class Trainer:
     def __init__(self, cfg):
         self.cfg = cfg
         with open_dict(cfg):
+            # saved_folder is where THIS run writes. init_from is where it loads starting
+            # weights, used to fine-tune an existing world model into a new run directory.
+            # Unset means load from saved_folder, which is the plain resume behaviour.
+            cfg["init_from"] = cfg.get("init_from", None)
             cfg["saved_folder"] = os.getcwd()
             log.info(f"Model saved dir: {cfg['saved_folder']}")
+            if cfg["init_from"]:
+                log.info(f"Initialising weights from: {cfg['init_from']}")
         cfg_dict = cfg_to_dict(cfg)
         model_name = cfg_dict["saved_folder"].split("outputs/")[-1]
         model_name += f"_{self.cfg.env.name}_f{self.cfg.frameskip}_h{self.cfg.num_hist}_p{self.cfg.num_pred}"
@@ -130,14 +138,35 @@ class Trainer:
             frameskip=self.cfg.frameskip,
         )
 
+        # Model widths come from the demo slicer. data_source can replace datasets['train'] with
+        # a ConcatDataset or a Subset, neither of which forwards these attributes, so read them
+        # while it is still the plain slicer.
+        self.train_dims = {k: getattr(self.datasets["train"], k)
+                           for k in ("proprio_dim", "action_dim", "state_dim")}
+        # The demo windows, captured BEFORE _build_capped_train_set replaces datasets['train'],
+        # so the 'demo' group really is the demonstrations.
+        self._demo_train = self.datasets["train"]
+
+        # What the training set is made of: up to three independently capped groups of windows
+        # (demonstrations / planner-success / planner-failure), plus an orthogonal
+        # See _build_capped_train_set for the full contract.
+        self._build_capped_train_set()
+
+
         self.train_traj_dset = traj_dsets["train"]
         self.val_traj_dset = traj_dsets["valid"]
+
+        # The capped concat already sets the mix by group SIZE, so no sampler is needed. One
+        # mechanism (the caps) instead of the old caps-vs-proportions precedence chain.
+        _train_sampler = None
+
 
         self.dataloaders = {
             x: torch.utils.data.DataLoader(
                 self.datasets[x],
                 batch_size=self.cfg.gpu_batch_size,
                 shuffle=False,   # already shuffled in TrajSlicerDataset
+                sampler=(_train_sampler if x == "train" else None),
                 num_workers=self.cfg.env.num_workers,
                 collate_fn=None,
             )
@@ -208,18 +237,349 @@ class Trainer:
         return ckpt_path, model_name, model_epoch
 
     def load_ckpt(self, filename="model_latest.pth"):
-        ckpt = torch.load(filename)
+        ckpt = torch.load(filename, weights_only=False)
         for k, v in ckpt.items():
             self.__dict__[k] = v
         not_in_ckpt = set(self._keys_to_save) - set(ckpt.keys())
         if len(not_in_ckpt):
             log.warning("Keys not found in ckpt: %s", not_in_ckpt)
 
+    def _build_capped_train_set(self):
+        """Build datasets['train'] from up to FOUR independently capped groups.
+
+        Groups. Which two PLANNED groups exist depends on planned_split:
+          demo      the demonstration windows
+          planned_split=planner   (default)
+            success   planned trajectories where the PLANNER reached its goal
+            failure   planned trajectories where it did not
+          planned_split=wm_error
+            wm_fail   planned trajectories whose endpoint the WORLD MODEL mispredicted, at the
+                      planned_wm_err_pct percentile of THIS pool -- recomputed every round, so it
+                      moves as the model changes
+            wm_ok     the complement
+          rollout   the POLICY's own scouting episodes, recorded when
+                    rollout_record_episodes > 0. Dynamics do not care who chose the action, so a
+                    failed policy episode is valid world-model data -- and it is exactly where
+                    the model is wrong. ~300 frames per episode against a planned trajectory's
+                    26, so this is where the volume comes from.
+
+        Each group has its own cap, in WINDOWS:
+          null -> no cap, use every window the group has
+          0    -> exclude the group entirely
+          N    -> a seeded random N-window subset
+
+        Any combination is legal: none, some or all capped. The training mix is whatever the caps
+        leave behind, so there is exactly ONE mechanism and no precedence between options. This
+        replaces data_source / original_weight / original_max_windows / plan_on_success /
+        plan_on_failure / plan_on_original, which overlapped and silently overrode one another.
+        """
+        def _cap_of(key):
+            v = self.cfg.get(key, None)
+            if v is None:
+                return None
+            v = int(v)
+            if v < 0:
+                raise ValueError(f"{key} must be >= 0 or null, got {v}")
+            return v
+
+        def _demo_proprio_stats():
+            """Demo proprio normalisation, so planned/rollout data reaches the model
+            in the same units the world model was trained on."""
+            d = self.datasets.get("train")
+            for _ in range(6):
+                if hasattr(d, "proprio_mean") and hasattr(d, "proprio_std"):
+                    return d.proprio_mean, d.proprio_std
+                d = getattr(d, "dataset", None)
+                if d is None:
+                    break
+            log.warning("no demo proprio_mean/std found; planned and rollout windows "
+                        "will use RAW proprioception")
+            return None, None
+
+        _p_mean, _p_std = _demo_proprio_stats()
+
+        split = str(self.cfg.get("planned_split", "planner")).lower()
+        if split not in ("planner", "wm_error"):
+            raise ValueError(f"planned_split must be 'planner' or 'wm_error', got {split!r}")
+        # Which two planned groups this mode uses, and the planned_dset filter for each.
+        # The demo and rollout groups are mode-independent: demonstrations have no planner
+        # outcome, and policy rollouts have no world-model prediction (the policy never runs the
+        # world model), so neither can be split either way.
+        PLANNED_GROUPS = {
+            "planner":  {"success": ("all", True), "failure": ("policy_fail", False)},
+            "wm_error": {"wm_fail": ("wm_fail", False), "wm_ok": ("wm_ok", False)},
+        }
+        sel_of = PLANNED_GROUPS[split]
+        inactive = set().union(*(set(v) for v in PLANNED_GROUPS.values())) - set(sel_of)
+        for g in sorted(inactive):
+            if self.cfg.get(f"max_{g}_windows", None) is not None:
+                raise ValueError(
+                    f"max_{g}_windows is set but planned_split={split!r} does not use that "
+                    f"group. Its groups are {sorted(sel_of)}. Leave max_{g}_windows null, or "
+                    f"switch planned_split.")
+
+        caps = {"demo": _cap_of("max_demo_windows"),
+                "rollout": _cap_of("max_rollout_windows")}
+        for g in sel_of:
+            caps[g] = _cap_of(f"max_{g}_windows")
+
+        # PROPORTIONAL MODE. total_windows fixes the SIZE of the fine-tune's training set and
+        # frac_<group> fixes the MIX, so successive rounds see the same amount of data in the
+        # same ratio even as the pool grows. Give a fraction for all but ONE active group; the
+        # omitted one takes the remainder. Fractions override the max_*_windows caps.
+        _frac = None
+        _total = self.cfg.get("total_windows", None)
+        if _total is not None:
+            _total = int(_total)
+            _active = ["demo", "rollout"] + sorted(sel_of)
+            _fr, _missing = {}, []
+            for g in _active:
+                v = self.cfg.get(f"frac_{g}", None)
+                if v is None:
+                    _missing.append(g)
+                else:
+                    _fr[g] = float(v)
+            # rollout data only exists when rollout_record_episodes > 0, so an unset frac_rollout
+            # means 0 rather than "the remainder".
+            if "rollout" in _missing and len(_missing) > 1:
+                _fr["rollout"] = 0.0
+                _missing.remove("rollout")
+            if len(_missing) > 1:
+                raise ValueError(
+                    f"total_windows={_total} needs a frac_<group> for all but one of "
+                    f"{_active}; {_missing} were all unset, so the remainder is ambiguous.")
+            _sum = sum(_fr.values())
+            if _sum > 1.0 + 1e-6:
+                raise ValueError(f"the frac_<group> values sum to {_sum:.3f} > 1: {_fr}")
+            if _missing:
+                _fr[_missing[0]] = 1.0 - _sum
+            elif abs(_sum - 1.0) > 1e-6:
+                raise ValueError(
+                    f"every group has a frac_<group> so they must sum to 1, got {_sum:.3f}")
+            _frac = dict(_fr)
+            caps = {g: int(round(_total * _fr[g])) for g in _active}
+            log.info(f"total_windows={_total} with fractions "
+                     + ", ".join(f"{g}={_fr[g]:.2f}" for g in _active)
+                     + " -> caps " + ", ".join(f"{g}={caps[g]}" for g in _active))
+
+        err_pct = float(self.cfg.get("planned_wm_err_pct", 50.0))
+        seed = int(self.cfg.get("window_subset_seed", self.cfg.training.seed))
+
+        def _subset(ds, cap, label):
+            """None = every window, 0 = drop the group, N = a random N-window subset.
+
+            The subset is drawn fresh from window_subset_seed, which dagger_loop advances every
+            round, so successive rounds train on different windows of the same group rather than
+            one fixed slice. The group label is mixed into the seed so each group draws
+            INDEPENDENTLY -- without it two groups of equal length got identical index sets and
+            all groups' draws were correlated. Still fully reproducible from window_subset_seed.
+            """
+            if ds is None or len(ds) == 0 or cap == 0:
+                return None
+            if cap is None or cap >= len(ds):
+                # FAILSAFE for re-training on identical data. A cap at or above the group's size
+                # takes every window, so this round's set is last round's plus whatever is new.
+                log.warning(
+                    f"{label}: cap {'unset' if cap is None else cap} >= {len(ds):,} available, so "
+                    f"ALL of its windows are used and this round repeats last round's data for "
+                    f"this group. Set a cap below {len(ds):,} (or total_windows + frac_*).")
+                return ds
+            g = torch.Generator().manual_seed(seed + (zlib.crc32(label.encode()) & 0xFFFF))
+            idx = torch.randperm(len(ds), generator=g)[:cap].tolist()
+            log.info(f"{label}: capped {len(ds):,} -> {cap:,} random windows "
+                     f"(window_subset_seed {seed})")
+            return torch.utils.data.Subset(ds, sorted(idx))
+
+        planned_path = self.cfg.get("planned_data_path", None)
+        want = [g for g in sel_of if caps[g] != 0]
+        if want and not planned_path:
+            # a plain train.py run has no pool; demos only, same as the old data_source=original
+            log.info("no planned_data_path given -> training on demonstrations only")
+            want = []
+
+        groups, sizes, built, n_pool, n_planned_traj = [], {}, [], None, 0
+        if want:
+            from datasets.planned_dset import PlannedTrajDataset
+            from datasets.planned_dset import NoMatchingTrajectories
+            from datasets.traj_dset import TrajSlicerDataset
+            from datasets.img_transforms import default_transform
+            n_frames = self.cfg.num_hist + self.cfg.num_pred
+            for g in want:
+                select, only_succ = sel_of[g]
+                try:
+                    dset = PlannedTrajDataset(
+                        planned_path, transform=default_transform(self.cfg.img_size),
+                        select=select, only_successes=only_succ, wm_err_pct=err_pct,
+                        max_trajectories=self.cfg.get("planned_max_trajectories", None),
+                        selection=str(self.cfg.get("planned_selection", "first")),
+                        selection_seed=int(self.cfg.get("planned_selection_seed",
+                                                        self.cfg.training.seed)),
+                        proprio_mean=_p_mean, proprio_std=_p_std)
+                except NoMatchingTrajectories as e:
+                    # a pool can legitimately hold none of one outcome, e.g. round 0 before the
+                    # planner has failed at anything. Anything ELSE -- a bad select name, missing
+                    # world-model error metadata -- propagates, so a typo cannot masquerade as
+                    # an empty group and silently halve the fine-tune's data.
+                    log.warning(f"group {g!r}: no matching trajectories ({e}); skipped")
+                    sizes[g] = 0
+                    continue
+                # TrajSlicerDataset permutes with the GLOBAL numpy RNG. Restore the stream or a
+                # fine-tune diverges from a plain train run started with the same seed.
+                st = np.random.get_state()
+                sl = TrajSlicerDataset(dset, n_frames, self.cfg.frameskip)
+                np.random.set_state(st)
+                bad = {k: (self.train_dims[k], getattr(sl, k))
+                       for k in ("proprio_dim", "action_dim")
+                       if getattr(sl, k) != self.train_dims[k]}
+                if bad:
+                    raise ValueError(
+                        f"planned data at {planned_path} disagrees with the demo dataset on "
+                        + ", ".join(f"{k} (demo {a}, planned {b})" for k, (a, b) in bad.items())
+                        + ". It was generated by a world model trained on different data, so it "
+                          "cannot be mixed in.")
+                n_pool = getattr(dset, "n_pool", n_pool)
+                n_planned_traj += len(dset)
+                built.append((g, sl))
+
+        # ---- the rollout group ---------------------------------------------------------------
+        # Same shard layout as the planner pool, so the same dataset class reads it. select/
+        # only_successes do not apply here: these episodes have no planner outcome and no
+        # world-model prediction stored, so they are taken whole.
+        roll_path = self.cfg.get("rollout_data_path", None)
+        if caps["rollout"] != 0 and roll_path and Path(roll_path).is_dir():
+            from datasets.planned_dset import PlannedTrajDataset
+            from datasets.traj_dset import TrajSlicerDataset
+            from datasets.img_transforms import default_transform
+            try:
+                rd = PlannedTrajDataset(str(roll_path),
+                                        transform=default_transform(self.cfg.img_size),
+                                        select="all", only_successes=False,
+                                        proprio_mean=_p_mean, proprio_std=_p_std)
+                st = np.random.get_state()
+                rsl = TrajSlicerDataset(rd, self.cfg.num_hist + self.cfg.num_pred,
+                                        self.cfg.frameskip)
+                np.random.set_state(st)
+                rbad = {k: (self.train_dims[k], getattr(rsl, k))
+                        for k in ("proprio_dim", "action_dim")
+                        if getattr(rsl, k) != self.train_dims[k]}
+                if rbad:
+                    raise ValueError(
+                        f"rollout data at {roll_path} disagrees with the demo dataset on "
+                        + ", ".join(f"{k} (demo {a}, rollout {b})"
+                                    for k, (a, b) in rbad.items()))
+                built.append(("rollout", rsl))
+            except Exception as e:
+                # never let a missing/!malformed rollout pool kill a fine-tune that would
+                # otherwise run on the planner data
+                log.warning(f"group 'rollout': unusable ({type(e).__name__}: {e}); skipped")
+                sizes["rollout"] = 0
+        elif caps["rollout"] != 0 and roll_path:
+            log.info(f"group 'rollout': {roll_path} does not exist yet; skipped")
+            sizes["rollout"] = 0
+
+        if caps["demo"] != 0 and self._demo_train is not None:
+            built.append(("demo", self._demo_train))
+
+        # REALLOCATION. total_windows is a budget and frac_<group> a target ratio, but a group may
+        # not have that many windows -- early rounds have a small pool, wm_error keeps half of it.
+        # Give each group min(cap, what it has) and hand the shortfall to whoever has spare,
+        # weighted by the requested fractions, so the ratio is the closest achievable one and the
+        # total is preserved whenever the data exists at all. Never errors.
+        if _total is not None and built:
+            avail = {g: len(d) for g, d in built}
+            alloc = {g: min(caps.get(g, 0), avail[g]) for g in avail}
+            short = [g for g in avail if alloc[g] < caps.get(g, 0)]
+            deficit = _total - sum(alloc.values())
+            if deficit > 0:
+                spare = {g: avail[g] - alloc[g] for g in alloc if avail[g] > alloc[g]}
+                wsum = sum(_frac.get(g, 0.0) for g in spare)
+                for g in sorted(spare, key=lambda x: -_frac.get(x, 0.0)):
+                    if deficit <= 0:
+                        break
+                    share = (deficit if wsum <= 0
+                             else int(round(deficit * _frac.get(g, 0.0) / wsum)))
+                    take = min(spare[g], max(0, share), deficit)
+                    alloc[g] += take
+                    deficit -= take
+                for g in sorted(spare, key=lambda x: -(avail[x] - alloc[x])):
+                    if deficit <= 0:
+                        break
+                    take = min(avail[g] - alloc[g], deficit)
+                    alloc[g] += take
+                    deficit -= take
+            if short:
+                log.warning(
+                    "total_windows=%s not met at the requested ratio: " % _total
+                    + ", ".join(f"{g} wanted {caps.get(g, 0):,} had {avail[g]:,}" for g in short)
+                    + " -> using "
+                    + ", ".join(f"{g}={alloc[g]:,}" for g in sorted(alloc))
+                    + f" ({sum(alloc.values()):,} of {_total:,})")
+            caps.update(alloc)
+
+        for _g, _d in built:
+            _sub = _subset(_d, caps.get(_g, None), f"group {_g!r}")
+            sizes[_g] = 0 if _sub is None else len(_sub)
+            if _sub is not None:
+                if _g == "demo":
+                    groups.insert(0, _sub)   # demos first, index order matches the old concat
+                else:
+                    groups.append(_sub)
+
+        if not groups:
+            raise ValueError(
+                "every group is empty or capped to 0, so there is nothing to train on. Set at "
+                "least one of max_demo_windows / max_rollout_windows / "
+                + " / ".join(f"max_{g}_windows" for g in sorted(sel_of))
+                + " to a positive number or to null.")
+
+        self.datasets["train"] = (groups[0] if len(groups) == 1
+                                  else torch.utils.data.ConcatDataset(groups))
+        total = len(self.datasets["train"])
+        _order = ["demo"] + sorted(sel_of) + ["rollout"]
+        log.info(f"train set (planned_split={split}"
+                 + (f", err pct {err_pct}" if split == "wm_error" else "") + "): "
+                 + ", ".join(f"{g} {sizes.get(g, 0):,}" for g in _order)
+                 + f" windows -> {total:,} total")
+
+        n_plan_w = sum(sizes.get(g, 0) for g in sel_of)
+        counts = {f"data/{g}_windows": sizes.get(g, 0) for g in _order}
+        counts["data/planned_split"] = split
+        counts.update({
+            "data/total_windows": total,
+            "data/planned_windows": n_plan_w,
+            "data/planned_trajectories": n_planned_traj,
+            "data/pool_trajectories": n_pool,
+            "data/planned_window_frac": n_plan_w / max(1, total),
+        })
+        counts = {k: v for k, v in counts.items() if v is not None}
+        # dagger_loop reads this back so the numbers land on the loop run's round axis
+        with open(os.path.join(os.getcwd(), "data_counts.json"), "w") as f:
+            json.dump(counts, f, indent=2)
+        if getattr(self, "wandb_run", None) is not None:
+            self.wandb_run.summary.update(counts)   # sortable column in the runs table
+            self.wandb_run.log(counts)
+
+
     def init_models(self):
-        model_ckpt = Path(self.cfg.saved_folder) / "checkpoints" / "model_latest.pth"
+        _src = self.cfg.get("init_from") or self.cfg.saved_folder
+        # init_epoch picks WHICH checkpoint a fine-tune starts from. Without it this always loaded
+        # model_latest.pth, so a world model planned with at epoch 56 was fine-tuned from epoch 100.
+        _ep = self.cfg.get("init_epoch", None)
+        _ck = (f"model_{_ep}.pth" if _ep is not None and str(_ep) != "latest"
+               else "model_latest.pth")
+        model_ckpt = Path(_src) / "checkpoints" / _ck
+        if self.cfg.get("init_from") and not model_ckpt.exists():
+            raise FileNotFoundError(f"init_from checkpoint not found: {model_ckpt}")
         if model_ckpt.exists():
             self.load_ckpt(model_ckpt)
-            log.info(f"Resuming from epoch {self.epoch}: {model_ckpt}")
+            log.info(f"Resuming from epoch {self.epoch}, {model_ckpt}")
+            # Fine-tuning loads the weights but starts its own epoch count, so training.epochs
+            # is the number of fine-tune epochs rather than a total the checkpoint may already
+            # have passed. init_optimizers runs after this and rebuilds the optimizers at the
+            # configured learning rates, so the loaded optimizer state does not carry over.
+            if bool(self.cfg.get("reset_epoch", False)):
+                self.epoch = 0
+                log.info(f"reset_epoch, training {self.cfg.training.epochs} more epochs")
 
         # initialize encoder
         if self.encoder is None:
@@ -230,24 +590,73 @@ class Trainer:
             for param in self.encoder.parameters():
                 param.requires_grad = False
 
-        self.proprio_encoder = hydra.utils.instantiate(
-            self.cfg.proprio_encoder,
-            in_chans=self.datasets["train"].proprio_dim,
-            emb_dim=self.cfg.proprio_emb_dim,
-        )
+        # Build fresh encoders only when no checkpoint supplied them. Rebuilding unconditionally
+        # threw away the trained action/proprio encoders on every fine-tune or resume, so the
+        # predictor received embeddings it had never seen and had to relearn them from scratch.
+        if self.proprio_encoder is None:
+            self.proprio_encoder = hydra.utils.instantiate(
+                self.cfg.proprio_encoder,
+                in_chans=self.train_dims["proprio_dim"],
+                emb_dim=self.cfg.proprio_emb_dim,
+            )
         proprio_emb_dim = self.proprio_encoder.emb_dim
         print(f"Proprio encoder type: {type(self.proprio_encoder)}")
         self.proprio_encoder = self.accelerator.prepare(self.proprio_encoder)
 
-        self.action_encoder = hydra.utils.instantiate(
-            self.cfg.action_encoder,
-            in_chans=self.datasets["train"].action_dim,
-            emb_dim=self.cfg.action_emb_dim,
-        )
+        if self.action_encoder is None:
+            self.action_encoder = hydra.utils.instantiate(
+                self.cfg.action_encoder,
+                in_chans=self.train_dims["action_dim"],
+                emb_dim=self.cfg.action_emb_dim,
+            )
         action_emb_dim = self.action_encoder.emb_dim
         print(f"Action encoder type: {type(self.action_encoder)}")
 
         self.action_encoder = self.accelerator.prepare(self.action_encoder)
+
+        # Restrict the predictor's trainable parameters to its LAST transformer block plus the
+        # final norm, the approach adajepa uses (planning/adajepa.py:_select_predictor_params).
+        # Their setting is lr 5e-4 with steps 1 on that slice only, i.e. the rate that wrecks a
+        # full-predictor fine-tune is survivable when the slice is this small. Use it when
+        # fine-tuning a converged world model on a little new data.
+        if bool(self.cfg.get("finetune_last_layer_only", False)):
+            _pred = self.predictor
+            _pred = getattr(_pred, "module", _pred)   # unwrap accelerate/DDP
+            _tr = getattr(_pred, "transformer", None)
+            if _tr is None or not hasattr(_tr, "layers"):
+                raise ValueError(
+                    "finetune_last_layer_only needs a predictor with .transformer.layers "
+                    f"(ViTPredictor); got {type(_pred).__name__}.")
+            _keep = set()
+            for _prm in list(_tr.layers[-1].parameters()) + list(_tr.norm.parameters()):
+                _keep.add(id(_prm))
+            _n_on = _n_off = 0
+            for _prm in _pred.parameters():
+                if id(_prm) in _keep:
+                    _prm.requires_grad_(True); _n_on += _prm.numel()
+                else:
+                    _prm.requires_grad_(False); _n_off += _prm.numel()
+            log.info(f"finetune_last_layer_only: predictor trainable {_n_on:,} params, "
+                     f"frozen {_n_off:,} ({100*_n_on/max(1,_n_on+_n_off):.1f}% trainable, "
+                     f"last of {len(_tr.layers)} blocks + final norm)")
+
+        # Hold the action/proprio encoders fixed for the whole fine-tune. The predictor was
+        # trained against these exact embeddings; if both the embeddings and the predictor move
+        # at once the predictor is chasing a moving input representation, on the handful of
+        # windows a fine-tune round supplies (154 windows in wall round 0). Separate from
+        # bug-2's fix, which only made them LOAD from the checkpoint instead of being rebuilt
+        # from random -- loaded is not the same as frozen. finetune_last_layer_only forces this
+        # on, because there the surrounding predictor blocks are frozen too and the embeddings
+        # they were trained against must not shift underneath them.
+        if (bool(self.cfg.get("freeze_action_proprio_encoders", False))
+                or bool(self.cfg.get("finetune_last_layer_only", False))):
+            _n_enc = 0
+            for _enc in (self.action_encoder, self.proprio_encoder):
+                for _prm in _enc.parameters():
+                    _prm.requires_grad_(False)
+                    _n_enc += _prm.numel()
+            log.info(f"action and proprio encoders FROZEN ({_n_enc:,} params); "
+                     f"training.action_encoder_lr has no effect")
 
         if self.accelerator.is_main_process:
             self.wandb_run.watch(self.action_encoder)
@@ -299,11 +708,11 @@ class Trainer:
                     decoder_path = os.path.join(
                         self.base_path, self.cfg.env.decoder_path
                     )
-                    ckpt = torch.load(decoder_path)
+                    ckpt = torch.load(decoder_path, weights_only=False)
                     if isinstance(ckpt, dict):
                         self.decoder = ckpt["decoder"]
                     else:
-                        self.decoder = torch.load(decoder_path)
+                        self.decoder = torch.load(decoder_path, weights_only=False)
                     log.info(f"Loaded decoder from {decoder_path}")
                 else:
                     self.decoder = hydra.utils.instantiate(
@@ -764,6 +1173,43 @@ class Trainer:
 
         if self.accelerator.is_main_process:
             self.wandb_run.log(epoch_log)
+            # Running record of this fine-tune's loss curve, so dagger_loop can put it on the
+            # LOOP run's round axis. Rewritten every epoch, so a killed run still leaves a
+            # usable file. This is the series that showed validation loss rising every epoch of
+            # every round (+3%, +16%, +42% on 20261008212236_wall).
+            _vh = getattr(self, "_val_hist", [])
+            _vl = epoch_log.get("val_loss", None)
+            if _vl is not None:
+                _vh.append(float(_vl))
+                self._val_hist = _vh
+                _best_i = int(np.argmin(_vh))
+                _m = {"val_loss_per_epoch": _vh,
+                      "val_loss_first": _vh[0],
+                      "val_loss_final": _vh[-1],
+                      "val_loss_best": _vh[_best_i],
+                      "val_loss_best_epoch": _best_i + 1,
+                      "val_loss_delta_pct": 100.0 * (_vh[-1] - _vh[0]) / max(1e-12, abs(_vh[0])),
+                      "train_loss_final": float(epoch_log.get("train_loss", float("nan"))),
+                      "epochs_run": len(_vh)}
+                with open(os.path.join(os.getcwd(), "wm_metrics.json"), "w") as _f:
+                    json.dump(_m, _f, indent=2)
+
+                # BEST-CHECKPOINT SELECTION, the counterpart of train_policy's model_best.pt.
+                # Without it a fine-tune hands its LAST epoch forward, and on wall every round of
+                # every fine-tuning arm had val_loss_best_epoch == 1.
+                if _best_i == len(_vh) - 1:
+                    _bck = {}
+                    for _k in self._keys_to_save:
+                        _obj = self.__dict__[_k]
+                        _bck[_k] = (self.accelerator.unwrap_model(_obj)
+                                    if hasattr(_obj, "module") else _obj)
+                    os.makedirs("checkpoints", exist_ok=True)
+                    torch.save(_bck, "checkpoints/model_best.pth")
+                    with open(os.path.join(os.getcwd(), "model_best.json"), "w") as _bf:
+                        json.dump({"val_loss": _vh[-1], "epoch": len(_vh),
+                                   "metric": "val_loss"}, _bf, indent=2)
+                    log.info(f"[select] new best val_loss={_vh[-1]:.6f} at fine-tune epoch "
+                             f"{len(_vh)} -> checkpoints/model_best.pth")
         self.epoch_log = OrderedDict()
 
     def plot_samples(
@@ -837,7 +1283,17 @@ class Trainer:
 @hydra.main(config_path="conf", config_name="train")
 def main(cfg: OmegaConf):
     trainer = Trainer(cfg)
-    trainer.run()
+    try:
+        trainer.run()
+    finally:
+        # Close the run explicitly, on failures too. Without this a round that crashes, or one
+        # whose atexit hook does not get to run, stays marked 'running' in wandb forever.
+        _run = getattr(trainer, "wandb_run", None)
+        if _run is not None:
+            try:
+                _run.finish()
+            except Exception as _e:
+                print(f"wandb.finish failed: {_e}")
 
 
 if __name__ == "__main__":

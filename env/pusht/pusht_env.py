@@ -436,6 +436,14 @@ class PushTEnv(gym.Env):
         self.reset_to_state = reset_to_state
         self.coverage_arr = []
 
+        # anchor_pose is where the green T is DRAWN. It never moves. Every training frame has it
+        # here, so drawing it anywhere else would put observations off distribution.
+        # goal_pose is what coverage and reward SCORE against. It is invisible, and set_task_goal
+        # moves it without touching the picture. The two start equal, which reproduces the
+        # single-pose behaviour exactly until something calls set_task_goal.
+        self.anchor_pose = np.array([256, 256, np.pi / 4])   # x, y, theta (radians)
+        self.goal_pose = self.anchor_pose.copy()
+
     def reset(self):
         self._setup()
         if self.block_cog is not None:
@@ -587,7 +595,8 @@ class PushTEnv(gym.Env):
             "pos_agent": np.array(self.agent.position),
             "vel_agent": np.array(self.agent.velocity),
             "block_pose": np.array(list(self.block.position) + [self.block.angle]),
-            "goal_pose": self.goal_pose,
+            "goal_pose": self.goal_pose,       # scored against, invisible
+            "anchor_pose": self.anchor_pose,   # drawn, fixed
             "n_contacts": n_contact_points_per_step,
         }
         return info
@@ -606,8 +615,8 @@ class PushTEnv(gym.Env):
 
         draw_options = DrawOptions(canvas)
 
-        # Draw goal pose.
-        goal_body = self._get_goal_pose_body(self.goal_pose)
+        # Draw the fixed anchor, not the scored goal, which stays invisible.
+        goal_body = self._get_goal_pose_body(self.anchor_pose)
         for shape in self.block.shapes:
             goal_points = [
                 pymunk.pygame_util.to_pygame(
@@ -690,7 +699,7 @@ class PushTEnv(gym.Env):
         agent_pos_local = state_local[:2]
         block_pose_local = state_local[2:]
         tf_img_obj = st.AffineTransform(
-            translation=self.goal_pose[:2], rotation=self.goal_pose[2]
+            translation=self.anchor_pose[:2], rotation=self.anchor_pose[2]
         )
         tf_obj_new = st.AffineTransform(
             translation=block_pose_local[:2], rotation=block_pose_local[2]
@@ -706,7 +715,31 @@ class PushTEnv(gym.Env):
         return new_state
 
     def set_task_goal(self, goal):
-        self.goal_pose = goal
+        """Move the scored goal. The drawn anchor T is unaffected.
+
+        The goal survives reset(), so an env reused across episodes keeps it until
+        reset_task_goal() puts it back. Whatever pose builds the goal IMAGE the policy is
+        conditioned on has to be passed here too, or coverage scores a target the policy was
+        never given.
+        """
+        self.goal_pose = np.array(goal, dtype=float)
+
+    def reset_task_goal(self):
+        """Put the scored goal back on the drawn anchor."""
+        self.goal_pose = self.anchor_pose.copy()
+
+    def coverage_between(self, goal_pose, cur_pose):
+        """Overlap of the block at cur_pose with the block at goal_pose, in [0, 1].
+
+        Scores whichever goal is passed in, so an episode is graded against ITS OWN target rather
+        than the fixed pose the green marker is drawn at. Both poses are (x, y, angle).
+        """
+        g = self._get_goal_pose_body(np.asarray(goal_pose, dtype=float))
+        c = self._get_goal_pose_body(np.asarray(cur_pose, dtype=float))
+        g_geom = pymunk_to_shapely(g, self.block.shapes)
+        c_geom = pymunk_to_shapely(c, self.block.shapes)
+        area = g_geom.area
+        return float(g_geom.intersection(c_geom).area / area) if area > 0 else 0.0
 
     def _setup(self):
         self.space = pymunk.Space()
@@ -732,7 +765,8 @@ class PushTEnv(gym.Env):
             self.goal_color = pygame.Color("LightGreen")
         else:
             self.goal_color = pygame.Color("White")
-        self.goal_pose = np.array([256, 256, np.pi / 4])  # x, y, theta (in radians)
+        # set in __init__ and deliberately not reset here, so set_task_goal survives reset().
+        # reset_task_goal() restores the default.
 
         # Add collision handling
         self.collision_handeler = self.space.add_collision_handler(0, 0)

@@ -76,6 +76,7 @@ rollout_goal_offset: 25
 # --- which DEMO dataset folder to use (null = the default in conf/dataset/<env>.yaml) -------
 # MUST match the folder the WM was trained on.
 override_dataset_path: null
+policy_dataset_path: null
 
 # Run every env in this process instead of forked subprocesses. Slower but avoids EGL failures under fork.
 serial_env: false
@@ -93,6 +94,32 @@ env_start_method: spawn
 #   wandb_group   null -> auto "<env>-<basename(out_dir)>-<beta_schedule>".
 wandb_project: dino_wm_dagger
 wandb_group: null
+
+# --- world-model fine-tuning ------------------------------------------------------------------
+# false keeps the world model frozen for the whole run, the original behaviour. true fine-tunes
+# it after every round on the trajectories it predicted worst, and the next round plans with the
+# updated model.
+wm_finetune: false
+wm_train_config_name: train_point_maze
+# Which planned trajectories the world model trains on. wm_fail means the endpoint it predicted
+# was further from the real endpoint than wm_finetune_err_pct percent of the pool, so the bar
+# rises as the model improves. Every wm_fail mode needs probe_ckpt set in the gen config.
+#   all                 every planned trajectory
+#   policy_fail         the plan did not reach its goal
+#   wm_fail             the world model mispredicted the endpoint
+#   wm_and_policy_fail  both
+#   wm_fail_policy_ok   mispredicted but the plan still reached the goal
+wm_finetune_select: wm_and_policy_fail
+wm_finetune_err_pct: 50
+wm_finetune_epochs: 5
+# null keeps the learning rates in the world-model training config.
+wm_finetune_lr: null
+# original = planned data only, both = demonstrations as well. both resists forgetting.
+wm_finetune_data_source: both
+# Caps the demonstration windows in the mix. The concat is unweighted, so without a cap a large
+# demo set drowns out a few hundred planned windows.
+wm_original_max_windows: null
+wm_overrides: []
 
 # --- training ---------------------------------------------------------------------------------
 # Which trajectories the policy trains on.

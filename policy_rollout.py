@@ -46,9 +46,19 @@ def _sample_states(n_visited, n_take, mode, rng, skew):
                      f"'random_with_replacement', got {mode!r}")
 
 
+def _uint8_visual(x):
+    """Env renders come back as uint8 [0,255] or float [0,1]; shards store uint8."""
+    a = np.asarray(x)
+    if a.dtype != np.uint8:
+        a = (a * 255.0).clip(0, 255) if float(a.max(initial=0.0)) <= 1.5 else a.clip(0, 255)
+        a = a.astype(np.uint8)
+    return a
+
+
 @torch.no_grad()
 def rollout_policy(cfg, encoder, policy, device, env, n_episodes, horizon, base_seed,
-                   traj_dset=None, use_diffusion=False):
+                   traj_dset=None, use_diffusion=False,
+                   record_episodes=0, record_into=None):
     """Run the policy for n_episodes and return one record per episode:
         {seed, init_state, goal_state, env_info, states (T+1, S), success, min_dist}
 
@@ -56,6 +66,14 @@ def rollout_policy(cfg, encoder, policy, device, env, n_episodes, horizon, base_
     'valid'|'train'-> init/goal read from a DEMO trajectory in that split: random start
     """
     n_envs = int(cfg.n_envs)
+    # How many episodes to store in FULL (frames + actions) for world-model training. Off by
+    # default (0), in which case nothing below this line costs anything. record_into is an
+    # out-parameter rather than a second return value, so the other two callers of this function
+    # are unaffected.
+    record_episodes = int(record_episodes or 0)
+    if record_into is None:
+        record_episodes = 0
+    n_recorded = 0
     goal_source = str(cfg.get("rollout_goal_source", "random_state"))
     rs_mode = goal_source == "random_state"
     if goal_source not in ("random_state", "valid", "train"):
@@ -145,6 +163,12 @@ def rollout_policy(cfg, encoder, policy, device, env, n_episodes, horizon, base_
                 env.update_env(ep_env_infos)
 
         obs, state_0 = env.prepare(seeds, init_states)
+        # per-step buffers for the episodes this batch will record, if any
+        _rec = record_episodes > 0 and n_recorded < record_episodes
+        _vis_buf = [_uint8_visual(obs["visual"])] if _rec else None
+        _prop_buf = ([np.asarray(obs["proprio"])] if (_rec and "proprio" in obs) else
+                     ([] if _rec else None))
+        _act_buf = [] if _rec else None
         obs_stack = deque([embed(obs["visual"])], maxlen=cfg.window_size)
         # Seed the trajectory with the ENV's own state at reset, not the sampled init_states, for
         # some envs sample_random_init_goal_states returns a shorter vector than info["state"],
@@ -162,11 +186,11 @@ def rollout_policy(cfg, encoder, policy, device, env, n_episodes, horizon, base_
             gseq = None if goal_emb is None else goal_emb.expand(-1, cfg.window_size, -1, -1)
             action, _, _ = policy(obs_seq, gseq, None)
             if use_diffusion:
-                chunk = [action[:, t].cpu().numpy() for t in range(action.shape[1])]
+                chunk = [action[:, t].detach().cpu().numpy() for t in range(action.shape[1])]
             else:
                 # receding-horizon ensembling, identical to eval_on_env
                 if cfg.action_window_size > 1:
-                    action_list.append(action[:, -1].cpu().numpy())
+                    action_list.append(action[:, -1].detach().cpu().numpy())
                     if len(action_list) > cfg.action_window_size:
                         action_list = action_list[1:]
                     curr = np.array(action_list).mean(axis=0)[:, 0]
@@ -174,11 +198,24 @@ def rollout_policy(cfg, encoder, policy, device, env, n_episodes, horizon, base_
                         (c[:, 1:], np.zeros((c.shape[0], 1, c.shape[-1]))), axis=1)
                         for c in action_list]
                 else:
-                    curr = action[:, -1, 0, :].cpu().numpy()
+                    curr = action[:, -1, 0, :].detach().cpu().numpy()
                 chunk = [curr]
             for a in chunk:
-                obs, _, done, info = env.step(a * act_std + act_mean)
+                _raw_a = np.asarray(a) * act_std + act_mean
+                obs, _, done, info = env.step(_raw_a)
                 done = np.asarray(done)
+                if _rec and np.asarray(_raw_a).ndim != 2:
+                    # diffusion policies emit an action CHUNK per step, which does not stack into
+                    # the (T, act_dim) layout a shard needs. Drop recording rather than write a
+                    # malformed shard.
+                    print(f"[rollout] action ndim {np.asarray(_raw_a).ndim} != 2; "
+                          f"not recording this batch for world-model training")
+                    _rec = False
+                if _rec:
+                    _vis_buf.append(_uint8_visual(obs["visual"]))
+                    _act_buf.append(np.asarray(_raw_a, dtype=np.float32))
+                    if _prop_buf is not None and "proprio" in obs:
+                        _prop_buf.append(np.asarray(obs["proprio"]))
                 obs_stack.append(embed(obs["visual"]))
                 steps += 1
                 if info is not None and "state" in info[0]:
@@ -193,6 +230,31 @@ def rollout_policy(cfg, encoder, policy, device, env, n_episodes, horizon, base_
                     break
 
         traj = np.stack(visited, axis=1)   # (n_envs, T+1, S)
+        if _rec:
+            # (T+1) frames, actions padded to the same length so the shard matches the planner
+            # pool's layout exactly and the same dataset class can read it.
+            _V = np.stack(_vis_buf, axis=1)                      # (n_envs, T+1, H, W, C)
+            _T = _V.shape[1]
+            _A = np.stack(_act_buf, axis=1) if _act_buf else np.zeros((n_envs, 0, 1), np.float32)
+            if _A.shape[1] < _T:
+                _A = np.concatenate(
+                    [_A, np.zeros((n_envs, _T - _A.shape[1], _A.shape[2]), np.float32)], axis=1)
+            _P = (np.stack(_prop_buf, axis=1) if _prop_buf
+                  else np.zeros((n_envs, _T, 1), np.float32))
+            if _P.shape[1] != _T:   # proprio missing on some steps -> fall back to zeros
+                _P = np.zeros((n_envs, _T, 1), np.float32)
+            for i in range(min(real, record_episodes - n_recorded)):
+                record_into.append({
+                    "visual": torch.as_tensor(_V[i]),
+                    "actions": torch.as_tensor(_A[i]).float(),
+                    "states": torch.as_tensor(traj[i]).float(),
+                    "proprios": torch.as_tensor(_P[i]).float(),
+                    "seq_lengths": int(_T),
+                    "init_states": torch.as_tensor(init_states[i]).float(),
+                    "goal_states": torch.as_tensor(goal_states[i]).float(),
+                    "successes": bool(ever[i]),
+                })
+                n_recorded += 1
         for i in range(real):
             records.append({
                 "seed": seeds[i],
@@ -228,14 +290,39 @@ def select_relabel_states(records, cfg, rng, max_states=None):
     mode = str(cfg.get("state_sample_mode", "late"))
     per_ep = int(cfg.get("states_per_episode", 1))
     skew = float(cfg.get("state_sample_late_frac", 0.5))
+    # Jitter the chosen start positions. States taken from one failed episode sit very close
+    # together, a failing policy stays in one region, so several states per episode buy far less
+    # coverage than their count suggests (measured on wall: states from the same episode are ~5x
+    # closer to each other than states from different episodes, median 4.2 vs 22.7 units). Noise
+    # decorrelates them. The GOAL is untouched, so each sample stays the same task from a nearby
+    # start. Clipped to the range the episode actually visited, so the state stays plausible.
+    noise = float(cfg.get("relabel_init_noise", 0.0) or 0.0)
+    ndims = cfg.get("relabel_init_noise_dims", 2)
+    ndims = None if ndims is None else int(ndims)
+    # seeded from the round's rng (itself seeded by base_seed + r*100_000), so the jitter is
+    # reproducible and differs per round. Drawn only when jitter is on, so runs without it pick
+    # exactly the same states as before.
+    nrng = np.random.RandomState(rng.randrange(2**31)) if noise > 0 else None
+
+    def _jitter(state, traj):
+        if noise <= 0:
+            return state
+        s = np.array(state, dtype=float, copy=True)
+        d = s.shape[0] if ndims is None else min(ndims, s.shape[0])
+        T = np.asarray(traj, dtype=float)
+        lo, hi = T[:, :d].min(axis=0), T[:, :d].max(axis=0)
+        s[:d] = np.clip(s[:d] + nrng.normal(0.0, noise, size=d), lo, hi)
+        return s
+
     init_states, goal_states, env_infos, provenance = [], [], [], []
     for r in pool:
         for k in _sample_states(len(r["states"]), per_ep, mode, rng, skew):
-            init_states.append(r["states"][k])
+            init_states.append(_jitter(r["states"][k], r["states"]))
             goal_states.append(r["goal_state"])
             env_infos.append(r["env_info"])
             provenance.append({"seed": int(r["seed"]), "step": int(k),
-                               "episode_success": bool(r["success"])})
+                               "episode_success": bool(r["success"]),
+                               "init_noise": noise})
     if max_states is not None:
         want = int(max_states)
         if len(init_states) > want:

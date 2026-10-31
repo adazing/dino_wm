@@ -26,9 +26,12 @@ hydra:
 
 # --- the frozen world model (REQUIRED) ------------------------------------------------------
 # The env (wall) comes from THIS run's saved config, so there is no env= to set here.
+# ckpt_base_path: /nas/ada/dev/dino_wm
+# model_name: 2026-08-14/13-07-36   # REQUIRED, e.g. 2026-07-13/23-54-17
+# model_epoch: 89
 ckpt_base_path: /nas/ada/dev/dino_wm
-model_name: 2026-08-14/13-07-36   # REQUIRED, e.g. 2026-07-13/23-54-17
-model_epoch: 89
+model_name: 2026-09-07/02-48-37
+model_epoch: 56
 
 # --- Phase 1, random, env-sampled init/goal -------------------------------------------------
 # Where planning gets its init and goal pairs.

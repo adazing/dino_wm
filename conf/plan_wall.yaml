@@ -23,9 +23,11 @@ hydra:
             "export MASTER_PORT=$(for port in $(shuf -i 30000-65500 -n 20); do if [[ $(netstat -tupln 2>&1 | grep $port | wc -l) -eq 0 ]] ; then echo $port; break; fi; done;)",]
 
 # model to load for planning
-ckpt_base_path: /nas/ada/dev/dino_wm/   # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
-model_name: 2026-08-14/13-07-36
-model_epoch: 89
+ckpt_base_path: /nas/ada/dev/dino_wm/pretrained_models   # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
+# model_name: 2026-08-14/13-07-36
+model_name: wall_single
+model_epoch: model_latest.pth
+# model_epoch: 89
 
 seed: 99
 # Make world-model rollouts inside the planner reproducible. Slower.
@@ -75,7 +77,8 @@ debug_dset_init: False
 # Weight on the proprio term in loss_visual + alpha * loss_proprio.
 objective:
   _target_: planning.objectives.create_objective_fn
-  alpha: 1
+  # alpha: 1
+  alpha: 0
   base: 2
   mode: last
 

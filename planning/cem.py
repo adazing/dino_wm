@@ -47,6 +47,10 @@ class CEMPlanner(BasePlanner):
         self.opt_steps = opt_steps
         self.eval_every = eval_every
         self.logging_prefix = logging_prefix
+        # Bound on |action| in normalised space; null = unbounded (original behaviour).
+        self.action_clamp = kwargs.get("action_clamp", None)
+        if self.action_clamp is not None:
+            self.action_clamp = float(self.action_clamp)
         self.stop_loss_thresh = stop_loss_thresh
         self.patience = patience
         self.min_delta = float(min_delta)
@@ -125,6 +129,13 @@ class CEMPlanner(BasePlanner):
                     + mu[traj]
                 )
                 action[0] = mu[traj]   # optional, make the first one mu itself
+                # Keep the search inside the action range the world model was trained on.
+                # Unbounded, CEM drifts well outside it: on wall the pool had std ~1.5, mean
+                # -0.56, and 29% of steps beyond |2|. A 5-epoch fine-tune on 500 pool windows
+                # raised validation loss 28% at training loss 10.2; the same fine-tune on 500
+                # demonstration windows improved it, at training loss 0.011.
+                if self.action_clamp is not None:
+                    action = action.clamp(-self.action_clamp, self.action_clamp)
                 with torch.no_grad():
                     i_z_obses, i_zs = self.wm.rollout(
                         obs_0=cur_trans_obs_0,

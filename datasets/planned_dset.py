@@ -6,6 +6,7 @@ actions:  list of float tensors (T, A)  (normalized, same space as the
 states:  list of float tensors (T, Ds)
 proprios:  list of float tensors (T, Dp)
 """
+import numpy as np
 import torch
 import random
 from pathlib import Path
@@ -15,10 +16,29 @@ from typing import Callable, Optional
 from .traj_dset import TrajDataset
 
 
+# Every per-trajectory list a planned file holds. generate_planned_trajectories.py builds its
+# payload and clears its shard buffers from this, and _load_payload merges exactly these, so a
+# new field only has to be added here.
+class NoMatchingTrajectories(ValueError):
+    """The pool legitimately holds none of the requested outcome.
+
+    Distinct from a bad `select` name or missing metadata, which are programming/config errors.
+    train.py skips a group that raises THIS and lets anything else propagate, so a typo cannot
+    masquerade as "the planner has not failed at anything yet".
+    """
+
+
+TRAJ_KEYS = ("visual", "actions", "states", "proprios", "seq_lengths",
+             "init_states", "goal_states", "successes",
+             "wm_pred_final_states", "wm_latent_err", "dreamed_latents")
+
+
 class PlannedTrajDataset(TrajDataset):
     def __init__(self, data_path: str, transform: Optional[Callable] = None,
                  only_successes: bool = False, max_trajectories: Optional[int] = None,
-                 selection: str = "first", selection_seed: int = 0):
+                 selection: str = "first", selection_seed: int = 0,
+                 select: str = "all", wm_err_pct: float = 50.0,
+                 proprio_mean=None, proprio_std=None):
         """only_successes: keep only trajectories that reached the goal (needs the
         'successes' metadata). max_trajectories: cap how many to keep, applied after the
         success filter (None = all).
@@ -27,9 +47,26 @@ class PlannedTrajDataset(TrajDataset):
         'recent' -> the LAST N: a chronological queue over a growing pool, since shards
         'random' -> N drawn uniformly without replacement from the whole pool, seeded by
         'random_with_replacement' -> N drawn WITH replacement, so a trajectory can appear
+
+        select picks which trajectories are worth training a world model on. wm_fail means the
+        endpoint the world model predicted was further from the real endpoint than wm_err_pct
+        percent of this file's trajectories, so the threshold moves as the model improves.
+          all                 every trajectory
+          policy_fail         the plan did not reach its goal
+          wm_fail             the world model mispredicted the endpoint
+          wm_ok               the complement of wm_fail: error BELOW the percentile
+          wm_and_policy_fail  both
+          wm_fail_policy_ok   mispredicted but the plan still reached the goal
         """
         self.data_path = Path(data_path)
         self.transform = transform
+        # Generation stores proprio RAW; the demo loader normalises it, and that is what
+        # the world model was trained on. Raw puts it ~30 std off-centre into a FROZEN
+        # proprio encoder: wall fine-tune training loss 12 vs 0.011 on demonstrations.
+        self._proprio_mean = (None if proprio_mean is None
+                              else torch.as_tensor(proprio_mean).float())
+        self._proprio_std = (None if proprio_std is None
+                             else torch.as_tensor(proprio_std).float().clamp_min(1e-6))
         payload = self._load_payload(self.data_path)
         visual = payload["visual"]
         actions = payload["actions"]
@@ -41,8 +78,15 @@ class PlannedTrajDataset(TrajDataset):
         goal_states = payload.get("goal_states")   # planning goal state
         successes = payload.get("successes")   # reached-goal tag
 
+        wm_pred = payload.get("wm_pred_final_states")   # needs probe_ckpt at generation time
+
         # select trajectories, success filter first, then cap the count
         keep = list(range(len(seq_lengths)))
+        self.n_pool = len(seq_lengths)   # trajectories in the pool before any filtering
+        keep = self._apply_select(keep, str(select), float(wm_err_pct),
+                                  successes, wm_pred, states, seq_lengths,
+                                  payload.get("wm_latent_err"))
+        self.n_selected = len(keep)   # what select left, before only_successes/max_trajectories
         if only_successes:
             if successes is None:
                 raise ValueError(
@@ -84,6 +128,7 @@ class PlannedTrajDataset(TrajDataset):
         print(f"[planned] {self.data_path}: {len(keep)}/{len(seq_lengths)} trajectories kept "
               f"(only_successes={only_successes}, max_trajectories={max_trajectories}, "
               f"selection={selection})")
+        self.n_kept = len(keep)   # what actually gets trained on
         if len(keep) == 0:
             raise ValueError(
                 f"No planned trajectories left after filtering "
@@ -112,6 +157,70 @@ class PlannedTrajDataset(TrajDataset):
         self.proprio_dim = self.proprios[0].shape[-1]
 
     @staticmethod
+    def _apply_select(keep, select, wm_err_pct, successes, wm_pred, states, seq_lengths,
+                      wm_latent_err=None):
+        """Keep the trajectories `select` asks for. Returns keep unchanged for 'all'."""
+        if select == "all":
+            return keep
+        modes = ("all", "policy_fail", "wm_fail", "wm_ok", "wm_and_policy_fail",
+                 "wm_fail_policy_ok")
+        if select not in modes:
+            raise ValueError(f"select must be one of {modes}, got {select!r}")
+        if successes is None:
+            raise ValueError(f"select={select!r} needs 'successes' metadata in the planned file.")
+        needs_wm = select in ("wm_fail", "wm_ok", "wm_and_policy_fail", "wm_fail_policy_ok")
+        if needs_wm and not wm_latent_err and not wm_pred:
+            raise ValueError(
+                f"select={select!r} needs a world-model endpoint error. Generation writes "
+                f"'wm_latent_err' on any run and 'wm_pred_final_states' when probe_ckpt is set, "
+                f"and this file has neither. Regenerate, or use select=policy_fail.")
+
+        err = {}
+        if needs_wm:
+            if wm_latent_err:
+                # latent units, only the ordering matters since the threshold is a percentile
+                for i in keep:
+                    err[i] = float(wm_latent_err[i])
+                units = "latent"
+            else:
+                # probe path, the error is in world units
+                for i in keep:
+                    real = torch.as_tensor(states[i][int(seq_lengths[i]) - 1]).float().flatten()
+                    pred = torch.as_tensor(wm_pred[i]).float().flatten()
+                    n = min(len(real), len(pred))
+                    err[i] = float(torch.linalg.norm(pred[:n] - real[:n]))
+                units = "state"
+            thr = float(np.percentile(list(err.values()), wm_err_pct)) if err else 0.0
+
+        out = []
+        for i in keep:
+            ok = bool(successes[i])
+            wm_bad = needs_wm and err[i] >= thr
+            if select == "policy_fail" and not ok:
+                out.append(i)
+            elif select == "wm_ok" and not wm_bad:
+                out.append(i)
+            elif select == "wm_fail" and wm_bad:
+                out.append(i)
+            elif select == "wm_and_policy_fail" and wm_bad and not ok:
+                out.append(i)
+            elif select == "wm_fail_policy_ok" and wm_bad and ok:
+                out.append(i)
+        if not out:
+            n_fail = sum(1 for i in keep if not bool(successes[i]))
+            n_wm = sum(1 for i in keep if needs_wm and err[i] >= thr)
+            raise NoMatchingTrajectories(
+                f"select={select!r} matched no trajectories out of {len(keep)}. "
+                f"{n_fail} failed, {n_wm} were mispredicted"
+                + (f" (threshold {thr:.3f} {units})" if needs_wm else "")
+                + ". The two sets do not overlap, so lower wm_finetune_err_pct to widen the "
+                  "mispredicted set, or use select=wm_fail, which a percentile always fills.")
+        print(f"[planned] select={select} kept {len(out)}/{len(keep)} trajectories"
+              + (f", wm endpoint error threshold {thr:.3f} ({units})" if needs_wm else ""))
+        return out
+
+
+    @staticmethod
     def _load_payload(path: Path):
         """Load a single .pth file, or merge a directory of shard_*.pth files
         (produced by generate_planned_trajectories.py with shard_every > 0)."""
@@ -120,8 +229,7 @@ class PlannedTrajDataset(TrajDataset):
         shard_files = sorted(path.glob("shard_*.pth"))
         if not shard_files:
             raise FileNotFoundError(f"No shard_*.pth files found in {path}")
-        list_keys = ["visual", "actions", "states", "proprios", "seq_lengths",
-                     "init_states", "goal_states", "successes"]
+        list_keys = list(TRAJ_KEYS)
         merged = None
         for sf in shard_files:
             p = torch.load(sf, map_location="cpu", weights_only=False)
@@ -152,6 +260,8 @@ class PlannedTrajDataset(TrajDataset):
         if self.transform:
             image = self.transform(image)
         proprio = self.proprios[idx][frames].float()
+        if self._proprio_mean is not None:
+            proprio = (proprio - self._proprio_mean) / self._proprio_std
         obs = {"visual": image, "proprio": proprio}
         act = self.actions[idx][frames].float()
         state = self.states[idx][frames].float()

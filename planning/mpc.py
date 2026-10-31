@@ -26,6 +26,10 @@ class MPCPlanner(BasePlanner):
         wandb_run,
         logging_prefix="mpc",
         log_filename="logs.json",
+        # generate_planned_trajectories.py switches this off for dataset generation. cem.py
+        # already had it; MPCPlanner did not, so that guard silently skipped the outer loop
+        # and it kept rendering. plan.py still gets figures by default.
+        eval_save_plot=True,
         **kwargs,
     ):
         super().__init__(
@@ -52,6 +56,7 @@ class MPCPlanner(BasePlanner):
             wandb_run=self.wandb_run,
             log_filename=None,
         )
+        self.eval_save_plot = bool(eval_save_plot)
         self.is_success = None
         self.action_len = None   # keep track of the step each traj reaches success
         self.iter = 0
@@ -104,7 +109,10 @@ class MPCPlanner(BasePlanner):
                 action_so_far,
                 self.action_len,
                 filename=f"plan{self.iter}",
-                save_video=True,
+                # action_so_far GROWS every iteration, so decoding it through the WM decoder
+                # costs more memory each time. That is what ran out of 47 GB mid-generation.
+                save_video=self.eval_save_plot,
+                save_plot=self.eval_save_plot,
             )
             new_successes = successes & ~self.is_success   # Identify new successes
             self.is_success = (

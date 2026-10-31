@@ -5,3 +5,20 @@ plan_outputs
 wandb
 policy_outputs
 dagger
+# --- appended 2026-10-31 ---
+# manual backups
+*.bak
+*.bak_*
+*.orig
+# slurm output
+*.out
+*.err
+logs/
+dagger_loop.log
+# generated debug renders
+render_check/
+state_overlay/
+# checkpoints
+*.pth
+*.ckpt
+*.bak*

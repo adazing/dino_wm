@@ -115,8 +115,16 @@ def _load_probe(path, device):
         in_dim, hidden, out_dim = sd["net.1.weight"].shape[1], sd["net.1.weight"].shape[0], sd["net.4.weight"].shape[0]
     else:   # linear probe (recommended)
         in_dim, hidden, out_dim = sd["net.1.weight"].shape[1], 0, sd["net.1.weight"].shape[0]
+    # Building the module initialises its weights from the global RNG, which load_state_dict then
+    # overwrites. Restore the stream so a run with probe_ckpt set plans the same trajectories as
+    # one without it.
+    _cpu_rng = torch.get_rng_state()
+    _cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
     probe = Probe(in_dim, out_dim, hidden, 0.0).to(device).eval()
     probe.load_state_dict(sd)
+    torch.set_rng_state(_cpu_rng)
+    if _cuda_rng is not None:
+        torch.cuda.set_rng_state_all(_cuda_rng)
     smean = ck["state_mean"].to(device).float()
     sstd = ck["state_std"].to(device).float()
     rep = ck.get("rep", "pooled")
@@ -321,6 +329,23 @@ def _reproduce_eval_pairs(dset, cfg_dict, frameskip, goal_H):
         seen.add((tid, io))
         pairs.append((tid, io))
     return pairs
+
+
+def _latent_endpoint_err(evaluator, e_obses, i_final_z):
+    """Per-trajectory distance between the world model's imagined final latent and the real one.
+
+    The probe path measures the same disagreement in world units. This needs no probe, so it
+    works on any run, at the cost of an error in embedding units that only ranks trajectories.
+    """
+    from utils import move_to_device
+    last = {k: v[:, -1:] for k, v in e_obses.items()}
+    obs = move_to_device(evaluator.preprocessor.transform_obs(last), evaluator.device)
+    with torch.no_grad():
+        z = evaluator.wm.encode_obs(obs)
+    real = z["visual"][:, 0].flatten(1)
+    imag = i_final_z["visual"]
+    imag = imag[:, 0] if imag.dim() > real.dim() else imag
+    return torch.linalg.norm(real - imag.flatten(1).to(real.device), dim=1).cpu().numpy()
 
 
 def generate(cfg_dict):
@@ -533,6 +558,13 @@ def generate(cfg_dict):
     # MPC replans until every trajectory succeeds (mpc.py, `while not np.all(self.is_success)`) so
     # with max_iter=null an UNREACHABLE goal loops forever.
     is_mpc = isinstance(cfg_dict.get("planner"), dict) and "sub_planner" in cfg_dict["planner"]
+    # Cap MPC in EVERY mode. This used to apply only to plan_to_end / random_state, so dset and
+    # relabel (provided_states_path) generation with planner=mpc_cem replanned until every
+    # trajectory in the batch succeeded, i.e. forever as soon as one goal was out of reach.
+    if is_mpc and cfg_dict["planner"].get("max_iter") is None and not (plan_to_end or is_random_state):
+        cfg_dict["planner"]["max_iter"] = int(cfg_dict.get("mpc_max_iter", 20))
+        _log(f"[mpc] max_iter was null (unbounded) -> capped at {cfg_dict['planner']['max_iter']} "
+             f"replans (mpc_max_iter). Trajectories that hit the cap are saved with success=False.")
     if plan_to_end or is_random_state:
         _why = "plan_to_end" if plan_to_end else "goal_source=random_state"
         if is_mpc and cfg_dict["planner"].get("max_iter") is None:
@@ -571,8 +603,20 @@ def generate(cfg_dict):
     # WM-believed final state per trajectory, probe of the imagined final latent, only filled when
     # a probe_ckpt is set.
     wm_pred_final_states_out = []
+    wm_latent_err_out = []
     # imagined WM latents per trajectory (dream mode only), list of (T, P, D) tensors.
     dreamed_latents_out = []
+    # key -> the live list, so the payload, the shard flush and the shard merge all agree.
+    # The lists are only ever appended to and cleared, never rebound, so these stay current.
+    from datasets.planned_dset import TRAJ_KEYS
+    _traj = {"visual": visual, "actions": actions_out, "states": states_out,
+             "proprios": proprios_out, "seq_lengths": seq_lengths,
+             "init_states": init_states_out, "goal_states": goal_states_out,
+             "successes": successes_out, "wm_pred_final_states": wm_pred_final_states_out,
+             "wm_latent_err": wm_latent_err_out, "dreamed_latents": dreamed_latents_out}
+    if set(_traj) != set(TRAJ_KEYS):
+        raise RuntimeError(f"per-trajectory keys disagree with TRAJ_KEYS: "
+                           f"{set(_traj) ^ set(TRAJ_KEYS)}")
     base_seed = cfg_dict["seed"]
 
     # incremental sharded save, with shard_every > 0, flush accumulated trajectories to a shard
@@ -588,21 +632,11 @@ def generate(cfg_dict):
     counters = {"shard_idx": 0, "total": 0, "total_success": 0}
 
     def _payload():
-        return {
-            "visual": visual,
-            "actions": actions_out,
-            "states": states_out,   # full initial->...->final state per step
-            "proprios": proprios_out,
-            "seq_lengths": seq_lengths,
-            "init_states": init_states_out,   # planned initial state per trajectory
-            "goal_states": goal_states_out,   # planning goal state per trajectory
-            "successes": successes_out,   # whether the goal was reached
-            "wm_pred_final_states": wm_pred_final_states_out,   # WM-believed final state (probe), [] if no probe
-            "dreamed_latents": dreamed_latents_out,   # (dream mode) imagined WM latents per traj, [] otherwise
-            "dreamed": dream,   # true = sim-free imagined data (frame == 1 WM step)
-            "env_name": model_cfg.env.name,
-            "frameskip": frameskip,
-        }
+        # the per-trajectory lists, plus the run-level fields that are not per trajectory
+        return {**_traj,
+                "dreamed": dream,   # true = sim-free imagined data (frame == 1 WM step)
+                "env_name": model_cfg.env.name,
+                "frameskip": frameskip}
 
     def _flush_shard():
         if len(seq_lengths) == 0:
@@ -613,9 +647,7 @@ def generate(cfg_dict):
         counters["total_success"] += int(sum(1 for s in successes_out if s))   # None (dream) -> not a success
         _log(f"  shard {counters['shard_idx']}: saved {len(seq_lengths)} trajectories -> {path}")
         counters["shard_idx"] += 1
-        for lst in (visual, actions_out, states_out, proprios_out, seq_lengths,
-                    init_states_out, goal_states_out, successes_out, wm_pred_final_states_out,
-                    dreamed_latents_out):
+        for lst in _traj.values():
             lst.clear()
 
     _log(f"generation start: env={model_cfg.env.name} trajectories={total} rounds={n_rounds} "
@@ -625,6 +657,10 @@ def generate(cfg_dict):
     pbar = tqdm.trange(n_rounds, desc="planning rounds", unit="round")
     run_seen, run_reached = 0, 0   # running totals for the progress bar
     wm_err_run = {"sum": 0.0, "n": 0}   # cumulative WM endpoint-error mean (probe_ckpt only)
+    lat_err_run = []   # every trajectory's imagined-vs-real latent error, no probe needed
+    # graded overlap with each trajectory's OWN goal, envs that expose it (pusht). Binary
+    # success only says reached/not, this says how close the ones that missed actually got.
+    cov_run = []
     # cumulative trajectory-length stats, kept separately from seq_lengths because that list is
     # cleared on every shard flush
     steps_run = {"sum": 0, "n": 0, "succ_sum": 0.0, "succ_n": 0}
@@ -758,16 +794,28 @@ def generate(cfg_dict):
                     "the probe was trained on a different encoder/img_size/rep than this WM produces.")
             wm_final_states = probe_decode(feat_final).cpu().numpy()   # (b, S)
         else:
-            logs, successes, e_obses, e_states = workspace.evaluator.eval_actions(
+            logs, successes, e_obses, e_states, i_final_z = workspace.evaluator.eval_actions(
                 plan_actions.detach(),
                 action_len,
                 save_video=save_video,
                 save_plot=save_plot,
                 filename=f"planned_round{r}",
+                return_imagined=True,
             )
+        # world-model endpoint error per trajectory, the selector wm_finetune_select uses.
+        wm_latent_err = None
+        if not dream and e_obses is not None:
+            try:
+                wm_latent_err = _latent_endpoint_err(workspace.evaluator, e_obses, i_final_z)
+            except Exception as _e:
+                _log(f"[wm] latent endpoint error unavailable ({_e}), "
+                     f"wm_finetune_select=wm_* will need probe_ckpt")
         _t3 = time.perf_counter()
         t_setup, t_plan, t_eval = _t1 - _t0, _t2 - _t1, _t3 - _t2
         t_setup_total += t_setup; t_plan_total += t_plan; t_eval_total += t_eval
+        _cov_round = logs.get("mean_coverage")
+        if _cov_round is not None and np.isfinite(_cov_round):
+            cov_run.append(float(_cov_round))
         _log(f"[round {r}/{n_rounds}] success_rate={logs.get('success_rate')} | "
              f"plan={t_plan:.1f}s setup={t_setup:.1f}s eval={t_eval:.1f}s "
              f"({n_evals} trajs, {t_plan / max(1, n_evals):.2f}s/traj planning)")
@@ -820,6 +868,9 @@ def generate(cfg_dict):
             successes_out.append(success_i)
             if wm_final_states is not None:
                 wm_pred_final_states_out.append(torch.as_tensor(wm_final_states[i]).float())
+            if wm_latent_err is not None:
+                wm_latent_err_out.append(float(wm_latent_err[i]))
+                lat_err_run.append(float(wm_latent_err[i]))
 
         # trajectory LENGTH stats for this round. A stored trajectory has T frames covering T-1
         # executed env actions, so "steps" = T-1.
@@ -922,6 +973,14 @@ def generate(cfg_dict):
             # per-round trajectory-length stats, mean/median/min/max/std, plus the running mean
             # computed above.
             wlog.update(_step_logs)
+            if wm_latent_err is not None and len(wm_latent_err):
+                # imagined vs real final latent, no probe needed. With wm_finetune on this
+                # should fall round over round, which is the check that fine-tuning worked.
+                wlog.update({
+                    "wm/latent_err": float(np.mean(wm_latent_err)),
+                    "wm/latent_err_median": float(np.median(wm_latent_err)),
+                    "wm/latent_err_p90": float(np.percentile(wm_latent_err, 90)),
+                })
             if wm_vs_real is not None:   # probe_ckpt set, WM belief vs sim reality
                 wlog.update({
                     "wm/endpoint_err": wm_vs_real,   # WM-believed final vs real final (per round)
@@ -976,7 +1035,14 @@ def generate(cfg_dict):
             json.dump({"trajectories": int(counters["total"]),
                        "successes": int(counters["total_success"]),
                        "shards": int(counters["shard_idx"]),
-                       "rounds": int(n_rounds)}, _mf, indent=2)
+                       "rounds": int(n_rounds),
+                       "success_rate": (counters["total_success"] / counters["total"]
+                                        if counters["total"] else None),
+                       "wm_latent_err": (float(np.mean(lat_err_run)) if lat_err_run else None),
+                       "wm_latent_err_median": (float(np.median(lat_err_run)) if lat_err_run else None),
+                       "wm_latent_err_p90": (float(np.percentile(lat_err_run, 90))
+                                             if lat_err_run else None),
+                       "coverage": (float(np.mean(cov_run)) if cov_run else None)}, _mf, indent=2)
         return shard_dir
 
     torch.save(_payload(), out_path)

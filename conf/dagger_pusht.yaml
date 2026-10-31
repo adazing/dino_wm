@@ -1,7 +1,16 @@
 # DAgger for PUSHT.
-#   generation  -> gen_pusht_dset.yaml, goal_source, dset, goals read from demos
-#   rollout     -> rollout_goal_source, valid  (the policy is given demo tasks.
-#   eval passes -> includes the pusht 'task' coverage pass, which wall does not have
+#
+# AS WRITTEN THIS IS RUN P1: policy from scratch on planned data only, frozen world model, cem.
+
+#   policy trains on   planned data only   (policy_max_original_windows: 0)
+#   world model        frozen              (wm_finetune: false)
+#   P2 planned-only WM fine-tune, last-layer:  add  wm_finetune=true wm_finetune_last_layer_only=true measure_random_trajectories=10
+#   P3 plain BC on the 206 clean demos:        train_policy.py directly, see run_plan.sh
+#   P4 P1 + the 206 demos in the policy mix:   add  policy_max_original_windows=null policy_dataset_path=/nas/ada/dev/dynamo/data/dynamo_repro_datasets/pusht_dataset
+# Compare pusht runs on task/ (full-task coverage) and goal25_valid; pusht has no env-sampled pass.
+# Caveat: P1/P2 load pusht_noise (whose val split generation also plans from), P3/P4 load
+# pusht_dataset, so the valid splits differ between those two pairs.
+# Data per round, epochs, batch size and learning rates unchanged.
 defaults:
   - _self_
   - env_vars: env_vars
@@ -20,8 +29,8 @@ hydra:
   run:
     dir: .
 
-ckpt_base_path: /nas/ada/dev/dino_wm
-model_name: null   # REQUIRED, the pusht WM run under ${ckpt_base_path}/outputs/
+ckpt_base_path: /nas/ada/dev/dino_wm/pretrained_models
+model_name: pusht
 model_epoch: latest
 
 # Timestamped per launch, so every run gets its own directory and nothing from a previous run is
@@ -30,7 +39,10 @@ out_dir: /nas/ada/dev/dino_wm/dagger/${now:%Y%m%d%H%M%S}_${env.name}_${beta_sche
 seed: 100000
 
 rounds: 10
-trajectories_per_round: 100
+# 150, not 100. More data per round is the lever that is actually moving pusht (0.18->0.40 across
+# rounds while every round saturates internally). Costs ~35 min/round of generation, paid for by
+# the epochs 300->150 cut above.
+trajectories_per_round: 150
 
 # Fraction of each round's episodes driven by the planner instead of the policy.
 #   constant_1    planner every round, no policy rollout and no relabelling
@@ -50,6 +62,12 @@ rollout_goal_source: valid
 rollout_goal_offset: 25
 rollout_episodes: 200
 rollout_horizon: 300
+# How many scouting episodes to store in FULL (frames, actions, states, proprios) as world-model
+# training data, in the planner pool's shard format, accumulating in <out_dir>/rollout_pool.
+# 0 = off, store nothing, which is the default and the old behaviour. Visuals are uint8 at
+# 150,528 bytes a frame, so 25 episodes of ~300 steps is roughly 1.1 GB per round -- which is why
+# this is capped by EPISODE count here and by WINDOW count via wm_max_rollout_windows.
+rollout_record_episodes: 0
 # Relabel only episodes the policy failed. Falls back to all episodes if none failed.
 relabel_failures_only: true
 episodes_to_relabel: null
@@ -57,19 +75,43 @@ episodes_to_relabel: null
 #   worst   furthest the policy ever got from its goal
 #   random  uniform sample
 episode_pick: worst
-states_per_episode: 1
+# 4, with random_with_replacement below and relabel_init_noise above: one real failure becomes
+# several distinct jittered problems. Late in a run the policy fails only ~25 times in 200
+# episodes, so this is where the data has to come from.
+states_per_episode: 4
 # Which visited states along a policy rollout get relabelled. Index 0 is never picked.
 #   late                     spread over the last state_sample_late_frac of the episode
 #   uniform                  evenly spaced across the whole episode
 #   random                   uniform at random over the whole episode, no repeats
 #   random_with_replacement  independent draws, duplicates allowed
-state_sample_mode: late
+# random_with_replacement, so the same visited state can be drawn more than once. Without
+# jitter those would be identical and useless; with it each draw lands somewhere different.
+state_sample_mode: random_with_replacement
 # Fraction of the episode counted as late. Used only by state_sample_mode late.
 state_sample_late_frac: 0.5
 
+# Gaussian jitter added to each chosen relabel start position, in state units. The GOAL is not
+# touched, so a jittered sample is the same task from a nearby start, and the result is clipped to
+# the range that episode actually visited so the state stays plausible.
+# Why: states from one failed episode sit close together because a failing policy stays in one
+# region. Measured on wall, states from the same episode are about 5x closer to each other than
+# states from different episodes (median 4.2 vs 22.7 units), so states_per_episode > 1 buys much
+# less coverage than its count suggests. Jitter decorrelates them.
+# Paired with state_sample_mode=random_with_replacement it also MULTIPLIES data: the same visited
+# state can be drawn several times and each draw gets its own noise, turning one real failure into
+# several distinct problems near it.
+# 0 = off. States are on a ~512 canvas, so 5-15 is small but real.
+relabel_init_noise: 15
+# How many leading state dimensions the jitter touches. 2 is the agent/dot position, safe to move.
+# null = every dimension, which for pusht would also move the BLOCK and change the task.
+relabel_init_noise_dims: 2
+
 # --- generation ------------------------------------------------------------------------------
 gen_config_name: gen_pusht_dset
-gen_overrides: []
+# planner=cem is now also gen_pusht_dset.yaml's default, so this is belt-and-braces. With n_taken_actions 5 = horizon 5, mpc_cem
+# is just cem plus retries at up to 4x the cost, and it changed a second thing at once. Plain cem
+# solved 0.85 of demo goals in round 0 of earlier runs; the low rate was on the hard relabel states.
+gen_overrides: ["planner=cem"]
 shard_every: 5
 
 # Run every env in this process instead of forked subprocesses. Slower but avoids EGL failures under fork.
@@ -81,8 +123,26 @@ serial_env: false
 #   forkserver  children fork from one clean server process
 env_start_method: null
 
-# Demo dataset folder.
-override_dataset_path: null
+# Demo dataset folder for GENERATION and the WORLD-MODEL fine-tune. Must be the folder the
+# pretrained world model was trained on, or its predictions do not match the data.
+override_dataset_path: /nas/ada/dev/dino/data/pusht_noise
+
+# Demo folder for POLICY training, its demo-goal evals and the scouting rollout. null uses
+# override_dataset_path, so the policy and the world model share one folder.
+# pusht_dataset, the 206 clean human demos that the pretrained policy named by
+# train_policy_pusht.yaml's checkpoint setting was itself trained on. data_source=both needs
+# demos worth cloning, and
+# pusht_noise/train is 18,685 NOISE-injected rollouts that only reach the target 63% of the time.
+# Trade-off, this makes goal25_valid use pusht_dataset's index-based split again, so it no longer
+# scores the same 21 trajectories generation plans from. Set back to null to recover that.
+# null again. data_source=planned means no demonstrations enter the gradient, so the reason for
+# pointing at pusht_dataset (clean demos worth cloning) is gone. null makes the policy load
+# pusht_noise, whose train/ and val/ folders on disk mean goal25_valid scores the SAME 21
+# trajectories generation plans from.
+# Demo dataset folder for POLICY training, its demo-goal eval passes and the scouting rollout.
+# null falls back to override_dataset_path. Point it elsewhere only when the policy should clone
+# a different demo set than the world model was trained on.
+policy_dataset_path: null
 
 # --- wandb identity ---------------------------------------------------------------------------
 # Each round launches two subprocesses.
@@ -92,12 +152,167 @@ override_dataset_path: null
 wandb_project: dino_wm_dagger
 wandb_group: null
 
-# --- training --------------------------------------------------------------------------------
-# Which trajectories the policy trains on.
-#   original  demonstrations only
-#   planned   world-model planned trajectories only
-#   both      concatenated, weighted by window count rather than 50/50
-data_source: both
+# --- world-model fine-tuning ------------------------------------------------------------------
+# false keeps the world model frozen for the whole run, the original behaviour. true fine-tunes
+# it after every round on the trajectories it predicted worst, and the next round plans with the
+# updated model.
+wm_finetune: false
+wm_train_config_name: train_pusht
+# Which planned trajectories the world model trains on. wm_fail means the endpoint it predicted
+# was further from the real endpoint than wm_finetune_err_pct percent of the pool, so the bar
+# rises as the model improves. Every wm_fail mode needs probe_ckpt set in the gen config.
+#   all                 every planned trajectory
+#   policy_fail         the plan did not reach its goal
+#   wm_fail             the world model mispredicted the endpoint
+#   wm_and_policy_fail  both
+#   wm_fail_policy_ok   mispredicted but the plan still reached the goal
+# --- what the world-model fine-tune trains on -------------------------------------------------
+# INDEPENDENT caps, measured in WINDOWS (a window = num_hist + num_pred frames):
+#   null -> no cap, use every window the group has
+#   0    -> exclude that group entirely
+#   N    -> a seeded random N-window subset (window_subset_seed varies per round)
+# Any combination is legal: none, some, or all capped. The training mix is simply whatever the
+# caps leave behind, so there is one mechanism and no precedence between options.
+#   demo      the demonstration windows      (0 here = the old wm_finetune_data_source: planned)
+#   success   planned trajectories where the PLANNER reached its goal
+#   failure   planned trajectories where it did not
+# Measured on 20261008212236_wall: the fine-tune saw 154 windows against the ~59,500 the world
+# model was pretrained on, which is why five epochs could not move it and ten chained rounds drove
+# the planner from 9/10 to 0/10 on the fixed yardstick.
+#
+# HOW THE PLANNED TRAJECTORIES ARE SPLIT. Two modes; each has its own pair of caps, and setting a
+# cap belonging to the OTHER mode is a hard error rather than being silently ignored.
+#   planner   split on whether the PLANNER reached its goal. A fixed, objective fact about the
+#             task that never drifts.  -> wm_max_success_windows / wm_max_failure_windows
+#   wm_error  split on whether the WORLD MODEL mispredicted the trajectory's endpoint, at the
+#             wm_finetune_err_pct percentile of THIS round's pool. More relevant to what the world
+#             model needs to learn, but the threshold MOVES as the model changes: measured on
+#             20261008212236_wall it went 49.3 -> 58.9 -> 83.8 over three rounds, so a degrading
+#             model redefines its own failures. Harmless while both caps are null (nothing is
+#             excluded); only bites when you use the split to drop a group.
+#             -> wm_max_wm_ok_windows / wm_max_wm_fail_windows
+wm_planned_split: planner
+
+# --- mode-independent groups -----------------------------------------------------------------
+# Demonstrations. 0 here is the old wm_finetune_data_source: planned.
+wm_max_demo_windows: null
+# The POLICY's own scouting episodes, recorded when rollout_record_episodes > 0 below. The world
+# model learns frame+action -> next frame, and physics does not care who chose the action, so a
+# FAILED policy episode is valid data and is exactly where the model is wrong. ~300 frames per
+# episode against a planned trajectory's 26, so this is the volume lever.
+# NOT splittable either way: the policy never runs the world model, so a rollout has no prediction
+# that could be right or wrong, and no planner outcome either.
+wm_max_rollout_windows: null
+
+# --- planned groups, wm_planned_split: planner -----------------------------------------------
+wm_max_success_windows: null
+wm_max_failure_windows: null
+
+# --- planned groups, wm_planned_split: wm_error ----------------------------------------------
+wm_max_wm_ok_windows: null
+wm_max_wm_fail_windows: null
+
+# --- proportional mode for the world-model fine-tune --------------------------------------
+# The caps above fix each group's SIZE; the MIX is whatever the pool happens to hold. Measured
+# on wall: by round 6 the planner half of w_ftbase's set was 80% failed plans, because a
+# degrading world model produces more of them.
+#
+#   wm_total_windows: 500
+#   wm_frac_failure: 0.8      # 400 windows
+#   wm_frac_success: 0.1      # 50
+#   (wm_frac_demo omitted)    # the remaining 0.1 -> 50
+wm_total_windows: null
+wm_frac_demo: null
+wm_frac_rollout: null
+wm_frac_success: null
+wm_frac_failure: null
+wm_frac_wm_ok: null
+wm_frac_wm_fail: null
+
+
+# The percentile that divides wm_ok from wm_fail. Recomputed from the current pool every round,
+# so "50" always means the worse half of THIS round's data. Only read in wm_error mode.
+wm_finetune_err_pct: 50
+wm_finetune_epochs: 5
+# Which checkpoint each round's fine-tune STARTS from.
+#   chain  the previous round's fine-tuned world model. Drift compounds across rounds: measured on
+#          20261008212236_wall, the planner's success on a fixed 10-task yardstick fell 9/10 ->
+#          3/10 -> 0/10 over three chained rounds.
+#   base   the original pretrained checkpoint, every round. The planner still uses the newest
+#          fine-tune; only the starting point is pinned, so one round's drift cannot stack on the
+#          previous round's.
+wm_finetune_from: chain
+
+# Carry the fine-tune's BEST epoch forward rather than its last, selected on the world model's
+# validation loss. On wall every round of every fine-tuning arm reported val_loss_best_epoch ==
+# 1, so the loop was adopting the worst of five epochs. false restores the old behaviour.
+wm_use_best_checkpoint: true
+# null keeps the learning rates in the world-model training config.
+wm_finetune_lr: 1e-5
+# Restrict the world-model fine-tune to the predictor's LAST transformer block plus its final norm
+# instead of the whole predictor. From adajepa (planning/adajepa.py:_select_predictor_params),
+# which adapts only that slice and therefore tolerates lr 5e-4 with 1 step. A full-predictor
+# fine-tune at that rate took the planner from 77% to 0% here, so the small SLICE is the point,
+# not the small rate. Freezing ~86% of the predictor also cuts memory, which is what killed every
+# pusht fine-tune attempt (CUDA OOM at 35-45 GB in the VQVAE decoder).
+wm_finetune_last_layer_only: true
+# Hold the world model's action and proprio encoders fixed through every fine-tune. They are
+# loaded from the checkpoint either way (that was the bug-2 fix); this stops them being TRAINED.
+# Forced on by wm_finetune_last_layer_only. false restores the old trainable behaviour.
+wm_finetune_freeze_encoders: true
+
+
+# After each round, score the freshly trained policy on the SAME (init, goal) pairs the planner was
+# handed. The planner's rate is measured on the policy's own failures, which get harder every round,
+# so it cannot be read against the policy's goal25 passes at fixed difficulty. This puts both on
+# identical problems. Costs a few GPU-minutes per round. Logged to the loop run as relabel/*.
+# Hand the next round model_best.pt (best select_metric during the round) rather than
+# model_final.pt (the last epoch). false restores the old last-epoch behaviour.
+use_best_checkpoint: true
+# Fixed-difficulty world-model yardstick: N fresh random tasks per round, never trained on,
+# solved by the planner using THIS round's world model. The planner is a fixed search procedure,
+# so the only thing that can move this score is the world model -- which is how wall showed its
+# fine-tune driving the planner 9/10 -> 0/10 over three rounds. Without it a falling planner score
+# is ambiguous between a dying world model and harder relabel states. 0 = off.
+# WAS MISSING from this file entirely, so no pusht run has ever had a world-model yardstick.
+measure_random_trajectories: 10
+eval_policy_on_relabel: true
+# Env-step budgets for that eval; the first is what the gap is computed from.
+#   25   the planner's own budget, goal_H * frameskip. The fair head-to-head.
+#   300  the goal25 budget. Separates "the policy is slower" from "the policy cannot".
+relabel_eval_horizons: 25,300
+
+wm_overrides: []
+
+# NOTE data_source is no longer configured here: dagger_loop DERIVES it from
+# policy_max_original_windows / policy_max_planned_windows below, so there is one place
+# that decides what the policy trains on. A cap of 0 excludes that source.
+# --- what the POLICY trains on ---------------------------------------------------------------
+# Two INDEPENDENT caps in WINDOWS, same contract as the world model's:
+#   null -> no cap, use every window available
+#   0    -> exclude that source entirely (0 demos = the old data_source: planned)
+#   N    -> a seeded random N-window subset
+# Replaces data_source + policy_original_weight + original_max_trajectories, which were three
+# ways to express one thing: data_source gated the sources, policy_original_weight set the demo
+# share of each batch by SAMPLING, original_max_trajectories set it by TRUNCATION -- and the
+# weight was silently ignored unless data_source was 'both', so policy_original_weight: 0.5 did
+# nothing on every planned-only run.
+# NOTE the policy must never train on its own scouting rollouts: those are the episodes it FAILED,
+# and imitating them is the opposite of the point. Only the world model can use them, because it
+# learns physics and physics does not care who chose the action.
+# 0, not null: these runs train the policy on PLANNED data only, which is what
+# data_source: planned used to say. Set this to null (or a number) to bring demonstrations in --
+# that is the old data_source=both arm, and dagger_loop derives data_source from these two caps.
+policy_max_original_windows: 0
+policy_max_planned_windows: null
+# Per-arm policy-training overrides, appended after train_overrides so they win. null = use
+# whatever train_overrides says. Set these at launch, e.g. a data_source=both arm wants far fewer
+# epochs than a planned-only arm because its dataset is orders of magnitude larger:
+#   ++data_source=both ++policy_epochs=12 ++policy_original_max_trajectories=500 \
+#   ++policy_eval_on_env_freq=1
+policy_epochs: null
+policy_eval_on_env_freq: null
+policy_windows_per_epoch: null
 train_max_trajectories: null
 # Which trajectories a round loads when train_max_trajectories caps the pool.
 #   first                    oldest N
@@ -106,7 +321,7 @@ train_max_trajectories: null
 #   random_with_replacement  independent draws, duplicates allowed
 train_selection: first
 # Start each round from the previous round's weights instead of training from scratch.
-warm_start: false
+warm_start: true
 train_config_name: train_policy_pusht
 train_overrides:
   - env=pusht
@@ -115,21 +330,37 @@ train_overrides:
   - policy=vqbet
   - goal_conditional=true
   - future_conditional=true
-  - planned_only_successes=false
+  # false, not true. Discarding the ~70% of planned trajectories that missed threw away the
+  # planner's best attempt at each goal, which goal-conditioned BC still learns from, and
+  # biased training toward easy cases. Keeping them roughly triples the data per round.
+  - planned_only_successes=true
   - seed=42
   - batch_size=16
-  - epochs=1000
+  # No optim.lr override. The 5e-6 fine-tuning rate existed because the policy started from a
+  # pretrained checkpoint. train_policy_pusht.yaml now has checkpoint: null, so the policy trains
+  # from scratch and wants the normal 5.5e-5, which is the rate wall trains from scratch at.
+  # 300, not 1000. A thousand epochs per round on ~30 usable trajectories is many passes over
+  # very little data, and it made each round about 14 hours. 300 cuts that to roughly 5.
+  # 150, not 300. Measured on 20261008011328 rounds 1-5: the peak of
+  # goal25_valid/max_success_rate sits at epoch 300/300/250/150/50 as the pool grows 200->600, so a
+  # fixed budget over-trains late rounds and under-trains early ones. Capping at 150 costs 0.010 of
+  # peak on average (vs 0.022 at epoch 100) against a binomial se of 0.046, so it is inside the
+  # noise, and best-checkpoint tracking picks the peak within whatever budget is given.
+  # 150 passes over the pool, the same number in every arm. Measured on 20261008011328 rounds
+  # 1-5, the peak of goal25_valid/max_success_rate sat at epoch 300/300/250/150/50 as the pool
+  # grew 200->600; capping at 150 costs 0.010 of peak (vs 0.022 at 100) against a binomial se of
+  # 0.046, and best-checkpoint tracking keeps whatever the peak inside the budget is.
+  - epochs=150
   - save_every=50
   - eval_freq=10
-  - eval_on_env_freq=50
+  # every 25 of 150 epochs -> 6 selection points for model_best.pt, plus the final eval
+  - eval_on_env_freq=25
   - n_env_evals=100
   - n_envs=10
   - eval_horizon=300
   - save_eval_video=true
   - n_eval_videos=10
   - wandb_logging=true
-  # cap the demo side when mixing, so the planned data is not drowned out (null = all demos)
-  - original_max_trajectories=null
   # pusht HAS a coverage task, unlike wall, so the task pass is included here.
   - 'eval_passes=[{name:goal25_valid,type:goal,goal_offset:25,horizon:300,goal_source:valid},{name:goal25_train,type:goal,goal_offset:25,horizon:300,goal_source:train},{name:task,type:task,horizon:300,goal_source:valid}]'
 

@@ -62,6 +62,17 @@ optim:
   betas: [0.9, 0.999]
 batch_size: 16
 epochs: 5000
+# One epoch = this many windows, drawn with replacement, instead of one pass over the dataset.
+# null = one pass, which is the right unit for OVERFITTING (each example is revisited `epochs`
+# times whatever the dataset size); pinning it equalises compute instead, which makes revisit
+# counts differ by orders of magnitude between a small planned pool and data_source=both. Left
+# here for runs that deliberately want a fixed step budget.
+windows_per_epoch: null
+# Which eval metric picks checkpoints/model_best.pt, and whether higher or lower is better. The key
+# is "<eval pass>/<metric>" exactly as it appears in the "eval_on_env: {...}" log lines. null = off,
+# only model_final.pt is written. dagger_loop.py carries model_best.pt into the next round.
+select_metric: goal25_valid/max_success_rate
+select_mode: max
 num_workers: 8
 save_every: 50
 eval_freq: 10   # validation action-loss every N epochs

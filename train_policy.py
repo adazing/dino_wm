@@ -8,6 +8,8 @@ data_source=both  -> original + planned
 accelerate launch train_policy.py policy=vqbet  data_source=original
 """
 import os
+import json
+import zlib
 # MuJoCo defaults to the GLFW backend, which needs an X display and fails on a headless box.
 os.environ.setdefault("MUJOCO_GL", "egl")
 # Set before any CUDA init so torch.use_deterministic_algorithms() can make cuBLAS matmuls
@@ -460,7 +462,8 @@ def main(cfg):
             f"Set act_dim correctly in conf/env/{cfg.env.name}.yaml."
         )
 
-    dataset = make_raw_policy_traj(original, planned, cfg.data_source)
+    # NOTE there is no combined train dataset here any more. The capped path below builds each source
+    # separately so every window keeps its label, so concatenating up front would be wasted work.
 
     # how much data this run is actually training on.
     _n_orig = len(original[0]) if original else 0
@@ -468,10 +471,10 @@ def main(cfg):
     data_counts = {
         "data/original_trajectories": _n_orig,
         "data/planned_trajectories": _n_plan,
-        "data/total_trajectories": len(dataset),
+        "data/total_trajectories": _n_orig + _n_plan,
     }
     print(f"[data] source={cfg.data_source}: {_n_orig} original + {_n_plan} planned "
-          f"= {len(dataset)} trajectories")
+          f"= {_n_orig + _n_plan} trajectories")
 
     # policy + optimizer
     cbet_model = hydra.utils.instantiate(cfg.policy).to(device)
@@ -489,7 +492,16 @@ def main(cfg):
     if use_diffusion:
         from utils.normalizer import LinearNormalizer
         action_normalizer = LinearNormalizer()
-        action_normalizer.fit(dataset.get_all_actions())
+        # The capped path builds each source separately, so there is no combined `dataset` to
+        # fit on. Concatenate the actions of every source actually being trained on, unwrapping
+        # the Subset that a window cap introduces.
+        _acts = []
+        for _src in (original[:1] + planned[:1]):
+            _base = getattr(_src, "dataset", _src)
+            _acts.append(_base.get_all_actions())
+        if not _acts:
+            raise RuntimeError("no training source available to fit the action normalizer")
+        action_normalizer.fit(_acts[0] if len(_acts) == 1 else torch.cat(_acts, dim=0))
         cbet_model.set_normalizer(action_normalizer)
 
     # parameter counts
@@ -506,29 +518,26 @@ def main(cfg):
 
     # split, (optionally precompute embeddings), slice, build loaders
     precompute = bool(cfg.get("precompute_embeddings", True))
-    train_data, test_data = split_traj_datasets(
-        dataset, train_fraction=cfg.train_fraction, random_seed=cfg.seed
-    )
-    # with a tiny train set, e.g. a single segment the held-out split can be empty, skip the whole
-    # validation path rather than crash on an empty dataset (TrajectoryEmbeddingDataset indexes
-    # self.data[0]).
-    have_test = len(test_data) > 0
-    if not have_test:
-        print(f"[val] test split is empty (train_fraction={cfg.train_fraction}, "
-              f"{len(dataset)} trajectories), skipping the validation action-loss.")
-    data_counts["data/train_trajectories"] = len(train_data)
-    data_counts["data/valid_trajectories"] = len(test_data)
-    print(f"[data] split: {len(train_data)} train / {len(test_data)} valid "
-          f"(train_fraction={cfg.train_fraction})")
-    if do_wandb:
-        # summary puts them in the runs table as sortable columns, which is where rounds are
-        # compared.
-        wandb.run.summary.update(data_counts)
-        wandb.log(data_counts)
-    if precompute:
-        train_data = TrajectoryEmbeddingDataset(encoder, train_data, device=cfg.embed_device)
-        if have_test:
-            test_data = TrajectoryEmbeddingDataset(encoder, test_data, device=cfg.embed_device)
+    # deterministic mode, fix the shuffle order (generator); also seeds the weighted sampler below
+    loader_gen = torch.Generator().manual_seed(int(cfg.seed)) if deterministic else None
+
+    # --- what the policy trains on: two independent WINDOW caps --------------------------------
+    #   null -> no cap, use every window the source has
+    #   0    -> exclude that source entirely
+    #   N    -> a seeded random N-window subset
+    # Replaces data_source + original_weight + original_max_trajectories, which were three ways to
+    # express one thing: data_source gated the sources, original_weight set the demo share of each
+    # batch by SAMPLING, original_max_trajectories set it by TRUNCATION -- and the weight was
+    # silently ignored unless data_source was 'both', so policy_original_weight: 0.5 did nothing on
+    # every planned-only run. One mechanism now, no precedence, no silent ignores.
+    # No rollout cap: the policy must never imitate its own failed scouting episodes.
+    _caps = {}
+    for _src in ("original", "planned"):
+        _v = cfg.get(f"max_{_src}_windows", None)
+        if _v is not None and int(_v) < 0:
+            raise ValueError(f"max_{_src}_windows must be >= 0 or null, got {_v}")
+        _caps[_src] = None if _v is None else int(_v)
+
     future_conditional = bool(cfg.get("future_conditional", False))
     if future_conditional and not goal_conditional:
         raise ValueError("future_conditional=true requires goal_conditional=true")
@@ -538,22 +547,113 @@ def main(cfg):
                          min_future_sep=int(cfg.get("min_future_sep", cfg.action_window_size)),
                          future_seq_len=int(cfg.get("future_seq_len", 1)),
                          only_sample_tail=bool(cfg.get("only_sample_tail", False)))
-    train_data = VqbetTrajectorySlicerDataset(train_data, **slicer_kwargs)
-    if have_test:
-        test_data = VqbetTrajectorySlicerDataset(test_data, **slicer_kwargs)
-    # catch a train set too short to yield any windows, else training silently does nothing
-    if len(train_data) == 0:
+
+    def _cap_windows(ds, cap, label):
+        """None = every window, 0 = drop the source, N = a random N-window subset.
+
+        Drawn fresh from window_subset_seed, which dagger_loop advances every round, so each
+        round trains on a different slice rather than one fixed subset. The source label is mixed
+        into the seed so the two sources draw independently of each other.
+        """
+        if ds is None or len(ds) == 0 or cap == 0:
+            return None
+        if cap is None or cap >= len(ds):
+            return ds
+        _sd = int(cfg.get("window_subset_seed", cfg.seed)) + (zlib.crc32(label.encode()) & 0xFFFF)
+        _g = torch.Generator().manual_seed(_sd)
+        _idx = torch.randperm(len(ds), generator=_g)[:cap].tolist()
+        print(f"[data] {label}: capped {len(ds):,} -> {cap:,} random windows")
+        return torch.utils.data.Subset(ds, sorted(_idx))
+
+    # Each source is split, embedded and sliced on its own so every window keeps its label. For a
+    # single source that is identical to splitting the concatenation; with both sources it differs,
+    # which is why the goal_source=train eval pass replays a slightly different set than training
+    # saw whenever both are in play.
+    tr_parts, te_parts = [], []
+    n_tr_traj = n_te_traj = 0
+    for _name, _raw in (("original", original), ("planned", planned)):
+        if _caps[_name] == 0 or not _raw:
+            data_counts[f"data/{_name}_train_windows"] = 0
+            continue
+        _rawset = (make_raw_policy_traj(_raw, [], "original") if _name == "original"
+                   else make_raw_policy_traj([], _raw, "planned"))
+        _tr, _te = split_traj_datasets(_rawset, train_fraction=cfg.train_fraction,
+                                       random_seed=cfg.seed)
+        n_tr_traj += len(_tr)
+        n_te_traj += len(_te)
+        if precompute:
+            _tr = TrajectoryEmbeddingDataset(encoder, _tr, device=cfg.embed_device)
+            if len(_te) > 0:
+                _te = TrajectoryEmbeddingDataset(encoder, _te, device=cfg.embed_device)
+        _tr = VqbetTrajectorySlicerDataset(_tr, **slicer_kwargs)
+        if len(_tr) == 0:
+            raise ValueError(
+                f"0 {_name} training windows after slicing (window={cfg.window_size}, "
+                f"min_future_sep={int(cfg.get('min_future_sep', cfg.action_window_size))}). The "
+                f"trajectories are too short to yield a single window.")
+        _tr = _cap_windows(_tr, _caps[_name], _name)
+        data_counts[f"data/{_name}_train_windows"] = 0 if _tr is None else len(_tr)
+        if _tr is not None:
+            tr_parts.append(_tr)
+        if len(_te) > 0:
+            te_parts.append(VqbetTrajectorySlicerDataset(_te, **slicer_kwargs))
+
+    if not tr_parts:
         raise ValueError(
-            f"0 training windows after slicing (window={cfg.window_size}, "
-            f"min_future_sep={int(cfg.get('min_future_sep', cfg.action_window_size))}). The "
-            f"segment/trajectory is too short -- raise original_segment_length or shrink the window.")
+            "both sources are empty or capped to 0, so there is nothing to train on. Set "
+            "max_original_windows and/or max_planned_windows to a positive number or to null.")
+    train_data = tr_parts[0] if len(tr_parts) == 1 else torch.utils.data.ConcatDataset(tr_parts)
+    have_test = len(te_parts) > 0
+    test_data = ((te_parts[0] if len(te_parts) == 1 else torch.utils.data.ConcatDataset(te_parts))
+                 if have_test else [])
+    if not have_test:
+        print(f"[val] test split is empty (train_fraction={cfg.train_fraction}), skipping the "
+              f"validation action-loss.")
+    # The caps set the mix by SIZE, so no sampler. windows_per_epoch below may still install one
+    # to pin the epoch length.
+    train_sampler = None
+    data_counts["data/train_trajectories"] = n_tr_traj
+    data_counts["data/valid_trajectories"] = n_te_traj
+    data_counts["data/total_train_windows"] = len(train_data)
+    print("[data] " + ", ".join(f"{n} {data_counts.get(f'data/{n}_train_windows', 0):,}"
+                                for n in ("original", "planned"))
+          + f" windows -> {len(train_data):,} total")
+    if do_wandb:
+        # summary puts them in the runs table as sortable columns, which is where rounds are
+        # compared.
+        wandb.run.summary.update(data_counts)
+        wandb.log(data_counts)
+
 
     # deterministic mode, fix the shuffle order (generator) and per-worker RNG (worker_init_fn) so
     # the data pipeline is reproducible too.
-    loader_gen = torch.Generator().manual_seed(int(cfg.seed)) if deterministic else None
     seed_worker = _seed_worker if deterministic else None
+    # windows_per_epoch: pin one epoch to a fixed number of windows, so `epochs` is a unit of
+    # WORK rather than "one pass over whatever happens to be loaded". Without it the same epochs
+    # value means a few hundred optimizer steps on a small planned-only pool and over a hundred
+    # thousand with data_source=both on uncapped demos, and it grows every DAgger round as the pool
+    # grows -- so arms and rounds are not comparable. Draws with replacement in both paths; the
+    # weighted path keeps its per-source weights, so original_weight still sets the batch share.
+    # null = one pass over the data, the previous behaviour.
+    _wpe = cfg.get("windows_per_epoch", None)
+    if _wpe is not None:
+        _wpe = int(_wpe)
+        if _wpe < gpu_batch_size:
+            raise ValueError(f"windows_per_epoch={_wpe} < batch_size={gpu_batch_size}: "
+                             f"drop_last would make every epoch empty.")
+        if train_sampler is None:
+            train_sampler = torch.utils.data.RandomSampler(
+                train_data, replacement=True, num_samples=_wpe, generator=loader_gen)
+        else:
+            train_sampler = torch.utils.data.WeightedRandomSampler(
+                train_sampler.weights, num_samples=_wpe, replacement=True, generator=loader_gen)
+        data_counts["data/windows_per_epoch"] = _wpe
+        print(f"[data] windows_per_epoch={_wpe:,} -> {_wpe // gpu_batch_size:,} "
+              f"optimizer steps/epoch, fixed across arms and rounds")
+
     train_loader = torch.utils.data.DataLoader(
-        train_data, batch_size=gpu_batch_size, shuffle=True,
+        train_data, batch_size=gpu_batch_size,
+        shuffle=(train_sampler is None), sampler=train_sampler,
         num_workers=cfg.num_workers, pin_memory=False, drop_last=True,
         worker_init_fn=seed_worker, generator=loader_gen)
     test_loader = (torch.utils.data.DataLoader(
@@ -622,6 +722,47 @@ def main(cfg):
         }, ckpt_dir / name)
 
     metrics_history = []
+
+    # --- best-checkpoint tracking ----------------------------------------------------------------
+    # model_final.pt is only the last epoch, which is routinely NOT the best model: on wall round 0
+    # of 20261008010658, goal25_valid/max_success_rate peaked at 0.64 near epoch 150 and ended at
+    # 0.54. model_best.pt holds the weights that scored best on cfg.select_metric. The env eval runs
+    # BEFORE each epoch's training (see the save_ckpt comment below), so the weights written on a new
+    # best are exactly the ones that produced that score. select_metric: null turns this off and
+    # nothing but model_final.pt is written, as before.
+    _sel_metric = cfg.get("select_metric", None)
+    _sel_mode = str(cfg.get("select_mode", "max")).lower()
+    _sel_sign = 1.0 if _sel_mode == "max" else -1.0   # compare _sel_sign * value, always "higher"
+    _sel_best, _sel_epoch = -float("inf"), None
+    _sel_json = ckpt_dir / "model_best.json"
+    if _sel_metric and resume_epoch > 0 and _sel_json.is_file():
+        # Without this, the first eval after a resume would overwrite a better model_best.pt.
+        try:
+            _prev = json.loads(_sel_json.read_text())
+            if _prev.get("metric") == _sel_metric:
+                _sel_best, _sel_epoch = _sel_sign * float(_prev["value"]), int(_prev["epoch"])
+                print(f"[select] resuming with best {_sel_metric}={_prev['value']} "
+                      f"from epoch {_prev['epoch']}")
+        except Exception as _e:
+            print(f"[select] could not read {_sel_json}: {_e}")
+
+    def _maybe_save_best(metrics, epoch):
+        """Write model_best.pt when this eval beats every earlier one in the run."""
+        nonlocal _sel_best, _sel_epoch
+        if not _sel_metric or _sel_metric not in metrics:
+            return False
+        v = float(metrics[_sel_metric])
+        if _sel_sign * v <= _sel_best:
+            return False
+        _sel_best, _sel_epoch = _sel_sign * v, int(epoch)
+        save_ckpt("model_best.pt", epoch)
+        _sel_json.write_text(json.dumps(
+            {"metric": _sel_metric, "mode": _sel_mode, "value": v, "epoch": int(epoch)}, indent=2))
+        print(f"[select] new best {_sel_metric}={v:.4f} at epoch {epoch} -> model_best.pt")
+        if do_wandb:
+            wandb.log({"select/best_value": v, "select/best_epoch": int(epoch), "epoch": epoch})
+        return True
+
     for epoch in tqdm.trange(resume_epoch, cfg.epochs, disable=not accelerator.is_main_process):
         # closed-loop env eval (main process only). The other ranks resync at the barrier below so
         # DDP all-reduce in the train step doesn't desync.
@@ -636,6 +777,7 @@ def main(cfg):
                     metrics_history.append(metrics)
                     if do_wandb:
                         wandb.log({**{f"env/{k}": v for k, v in metrics.items()}, "epoch": epoch})
+                    _maybe_save_best(metrics, epoch)
                 except Exception as e:
                     print(f"eval_on_env skipped: {e}")
                     traceback.print_exc()
@@ -704,8 +846,11 @@ def main(cfg):
                 metrics_history.append(metrics)
                 if do_wandb:
                     wandb.log({**{f"env/{k}": v for k, v in metrics.items()}, "epoch": cfg.epochs})
+                # the fully-trained model competes too, so model_best.pt can legitimately be it
+                _maybe_save_best(metrics, cfg.epochs)
                 # best across all evals per pass, keys are "<pass>/<metric>", matched by suffix.
                 seen_keys = {k for m in metrics_history for k in m}
+                best_of = {}
                 best_specs = [(s, max) for s in ("final_coverage_mean", "max_coverage_mean",
                                                  "final_success_rate", "max_success_rate")]
                 best_specs += [(s, min) for s in ("final_goal_dist_mean", "closest_goal_dist_mean")]
@@ -715,8 +860,20 @@ def main(cfg):
                         if vals:
                             best = agg(vals)
                             print(f"best {key} over training: {best}")
+                            best_of[key] = best
                             if do_wandb:
                                 wandb.log({f"best/{key}": best, "epoch": cfg.epochs})
+                # dagger_loop reads this back so the policy's per-round scores land on the LOOP
+                # run's round axis. Without it goal25_valid/max_success_rate -- the reference
+                # metric -- was only recoverable by grepping this round's train log.
+                with open(Path(out_dir) / "metrics_final.json", "w") as _f:
+                    json.dump({"final": {k: float(v) for k, v in metrics.items()},
+                               "best": {k: float(v) for k, v in best_of.items()},
+                               "select_metric": _sel_metric,
+                               "select_best_value": (None if _sel_epoch is None
+                                                     else _sel_sign * _sel_best),
+                               "select_best_epoch": _sel_epoch,
+                               "epochs": int(cfg.epochs)}, _f, indent=2)
             except Exception as e:
                 print(f"final eval_on_env skipped: {e}")
                 traceback.print_exc()
@@ -724,11 +881,27 @@ def main(cfg):
 
     if accelerator.is_main_process:
         save_ckpt("model_final.pt", cfg.epochs - 1)
+        if _sel_metric:
+            if _sel_epoch is None:
+                print(f"[select] {_sel_metric} never appeared in any eval, so no model_best.pt "
+                      f"was written; consumers fall back to model_final.pt")
+            else:
+                print(f"[select] best {_sel_metric}={_sel_sign * _sel_best:.4f} at epoch "
+                      f"{_sel_epoch} -> checkpoints/model_best.pt")
         if eval_env is not None:   # tear down the reused eval env once, at the very end
             try:
                 eval_env.close()
             except Exception:
                 pass
+
+    # Close the run explicitly. The interpreter's atexit hook is unreliable once hydra and
+    # accelerate have torn down, which leaves a finished round stuck on 'running' in wandb.
+    # finish() also blocks until the upload drains, which matters on a network filesystem.
+    if do_wandb:
+        try:
+            wandb.finish()
+        except Exception as _e:
+            print(f"wandb.finish failed: {_e}")
 
 
 def make_eval_env(cfg, n_envs):

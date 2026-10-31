@@ -1,5 +1,9 @@
 _target_: planning.mpc.MPCPlanner
-max_iter: null   # unlimited if null
+# A CAP, not a target: the plan loop exits early as soon as every episode succeeds. null meant
+# np.inf, so a single never-solvable episode pinned a GPU indefinitely. 20 iters x
+# n_taken_actions 5 = 100 env steps, 4x the 25-step budget (goal_H 5 * frameskip 5) used
+# elsewhere, so this only fires on genuinely stuck episodes.
+max_iter: 20
 n_taken_actions: 5
 sub_planner:
   target: planning.cem.CEMPlanner

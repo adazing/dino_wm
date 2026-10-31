@@ -4,7 +4,7 @@ from gym.envs.registration import register
 try:
     from .pointmaze import U_MAZE
     _HAS_POINTMAZE = True
-except ImportError as _e:   # pragma: no cover
+except Exception as _e:   # pragma: no cover
     U_MAZE, _HAS_POINTMAZE = None, False
     print(f"[env] point_maze unavailable ({_e}); its registration is skipped.")
 

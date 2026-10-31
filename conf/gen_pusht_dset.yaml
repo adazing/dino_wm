@@ -2,6 +2,13 @@
 # from the env.
 defaults:
   - _self_
+  # mpc_cem, not cem. Upstream's own conf/plan_pusht.yaml uses MPCPlanner here. Open-loop cem
+  # picks all 5 actions from the first frame and executes them blind, a bad bet on a CONTACT-RICH
+  # task where the block's response is hard to predict. Planner success sat at 0.24-0.34 for 9
+  # rounds, starving the policy. Slower: MPC replans after every chunk, expect 2-4x generation.
+  # Plain CEM, not mpc_cem. MPCPlanner replans in a loop until every episode succeeds and
+  # re-renders a GROWING action sequence through the WM decoder each iteration, which OOMed a
+  # pusht round-0 generation after 116 min. dagger_pusht.yaml also pins planner=cem explicitly.
   - planner: cem
   - override hydra/launcher: submitit_slurm
 
@@ -40,7 +47,9 @@ goal_source: 'dset'
 #   val         held-out demos never trained on
 #   both        train and val concatenated
 #   eval_pairs  reproduce the exact episodes the BC eval scores on
-source_split: train   # train | val | both | eval_pairs
+# val plans from the held-out demos. The policy then trains on trajectories derived from
+# the split goal25_valid scores on, so that pass is no longer a clean held-out measure.
+source_split: val   # train | val | both | eval_pairs
 # How trajectories are drawn from the source split.
 #   sequential               in index order
 #   random                   uniform at random, no repeats

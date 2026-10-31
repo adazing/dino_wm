@@ -65,9 +65,17 @@ class PushTWrapper(PushTEnv):
         angle_diff = np.minimum(angle_diff, 2 * np.pi - angle_diff)
         success = pos_diff < 20 and angle_diff < np.pi / 9
         state_dist = np.linalg.norm(goal_state - cur_state)
+        # Graded overlap against THIS episode's goal. Binary success only says reached/not,
+        # coverage says how close, and it is scored on the goal actually being chased rather
+        # than the fixed pose the green marker sits at. Block pose is state[2:5].
+        try:
+            coverage = self.coverage_between(goal_state[2:5], cur_state[2:5])
+        except Exception:
+            coverage = float('nan')   # before the first reset there is no block to measure
         return {
             'success': success,
             'state_dist': state_dist,
+            'coverage': coverage,
         }
 
     def prepare(self, seed, init_state):

@@ -3,6 +3,11 @@ horizon: 5
 topk: 30
 num_samples: 300
 var_scale: 1
+
+# Bound on |action| during the search, in the dataset's normalised space where
+# demonstrations are std 1 centred on 0. null = unbounded, the original behaviour.
+action_clamp: null
+
 opt_steps: 30
 eval_every: 1
 
