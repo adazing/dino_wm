@@ -30,6 +30,7 @@ from omegaconf import OmegaConf
 from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
 
 from utils import seed as set_seed
+from env import env_shift
 from env.venv import SubprocVectorEnv
 
 from datasets.policy_dataset import (
@@ -966,6 +967,18 @@ def eval_on_env(cfg, encoder, policy, device, use_diffusion, epoch=0, out_dir=No
     goal_render_mode = str(cfg.get("eval_goal_render", "env"))
     if goal_render_mode not in ("env", "dataset"):
         raise ValueError(f"eval_goal_render must be 'env' or 'dataset', got {goal_render_mode!r}")
+    # Test-time environment shift. None unless eval_env_override is set, in which case it is
+    # merged on top of the per-trajectory env_info the dataset supplies, so the evaluation
+    # environment can differ from the one the data was collected in. See env/env_shift.py.
+    env_override = env_shift.parse_override(cfg, cfg.env.name)
+    if env_override and goal_render_mode == "dataset":
+        # The goal picture would then come from the unshifted dataset while the observations
+        # come from the shifted env, so the policy chases a target that contradicts what it
+        # sees and the number means nothing. Refuse rather than report it.
+        raise ValueError(
+            "eval_env_override is set but eval_goal_render='dataset', so the goal image would "
+            "show the UNSHIFTED environment while the rollout runs in the shifted one. Use "
+            "eval_goal_render='env' (the default) so the goal is redrawn in the shifted env.")
     if pass_type == "goal" and not rs_mode:
         if goal_off is None:
             raise ValueError(f"goal pass '{pass_name}' needs a goal_offset (frames ahead).")
@@ -999,10 +1012,15 @@ def eval_on_env(cfg, encoder, policy, device, use_diffusion, epoch=0, out_dir=No
     dset, dset_desc = _build_eval_traj_dataset(
         cfg, src_traj_dset, "valid" if rs_mode else base_split, pass_type,
         coverage_task=coverage_task, external=external)
+    _ekw = cfg.env.get("kwargs", {}) or {}
     print(f"[{pass_name or 'eval'}] type={pass_type} "
           f"goal_source={'random_state' if rs_mode else goal_source} "
           f"dataset={'task' if external else 'main'} -> {dset_desc}"
           + ("" if rs_mode else f" goal_render={goal_render_mode}"))
+    # Always print the shift, including "no shift", so a result can never be mistaken for the
+    # other condition when reading a log after the fact.
+    print(f"[{pass_name or 'eval'}] shift: " + env_shift.describe(
+        env_override, _ekw.get("obs_corruption"), _ekw.get("obs_corruption_level")))
 
     # reuse the caller's env if given, avoids per-eval forking, see make_eval_env otherwise create
     # one here and close it at the end (standalone use).
@@ -1081,12 +1099,15 @@ def eval_on_env(cfg, encoder, policy, device, use_diffusion, epoch=0, out_dir=No
         goal_render = None   # env-rendered goal image, b, H, W, C, rs_mode only
         if rs_mode:
             # random_state task, init/goal sampled from the env, on OPPOSITE sides of the wall.
-            if wall_fixed_info is not None:
-                env.update_env([wall_fixed_info] * n_envs)
+            # The shift must be applied BEFORE sampling, because generate_random_state bounds
+            # the samples with the wall's own faces.
+            _base = ([wall_fixed_info] * n_envs) if wall_fixed_info is not None else []
+            env_infos = env_shift.apply_override(_base, env_override, n_envs)
+            if env_infos:
+                env.update_env(env_infos)
             init_states, goal_states = env.sample_random_init_goal_states(seeds)
             init_states = np.asarray(init_states)
             goal_states = np.asarray(goal_states)
-            env_infos = ([wall_fixed_info] * n_envs) if wall_fixed_info is not None else []
             # render the goal state once for goal-conditioning and the video, goal frame on the
             # right.
             goal_obs, _ = env.prepare(seeds, goal_states)
@@ -1107,7 +1128,11 @@ def eval_on_env(cfg, encoder, policy, device, use_diffusion, epoch=0, out_dir=No
             # layout for envs that have one (wall, door/wall location).
             _init_frames = [dset.get_frames(j, [init_off[k]]) for k, j in enumerate(idxs)]
             init_states = np.stack([f[2][0].numpy() for f in _init_frames])
-            env_infos = [f[3] for f in _init_frames]
+            # The shift is merged over the dataset's own per-trajectory layout, so the goal
+            # render below and the rollout further down both see the SHIFTED env while the
+            # goal STATES still come from held-out demonstrations (the metric is unchanged).
+            env_infos = env_shift.apply_override([f[3] for f in _init_frames],
+                                                 env_override, n_envs)
             # goal = state `goal_off` frames ahead of the (possibly offset) start, clamped to the
             # trajectory end, if None, the final frame.
             if goal_off is None:
@@ -1122,6 +1147,10 @@ def eval_on_env(cfg, encoder, policy, device, use_diffusion, epoch=0, out_dir=No
                 # draw the goal at its own coordinates, exactly as the random_state path does.
                 if cfg.env.name == "wall" and env_infos and all(
                         "fix_door_location" in ei for ei in env_infos):
+                    env.update_env(env_infos)
+                elif env_override and env_infos:
+                    # non-wall env under a shift: the dataset path never calls update_env, so
+                    # without this the goal would be drawn by the UNSHIFTED env.
                     env.update_env(env_infos)
                 goal_obs, _ = env.prepare(seeds, goal_states)
                 goal_render = np.asarray(goal_obs["visual"])
@@ -1196,10 +1225,16 @@ def eval_on_env(cfg, encoder, policy, device, use_diffusion, epoch=0, out_dir=No
             if env_infos and all("fix_door_location" in ei for ei in env_infos):
                 env.update_env(env_infos)   # per-episode maze (valid / original)
             elif wall_fixed_info is not None:
-                env.update_env([wall_fixed_info] * n_envs)   # planned data, the fixed wall_single maze
+                # planned data, the fixed wall_single maze, shifted if a shift is configured
+                env.update_env(env_shift.apply_override(
+                    [wall_fixed_info] * n_envs, env_override, n_envs))
             elif b == 0:
                 print(f"[{pass_name or 'eval'}] wall: no maze in the data and no wall dataset to "
                       f"pull the fixed maze from -> DEFAULT maze; success/distance may be unreliable.")
+        elif env_override and env_infos:
+            # non-wall env under a shift. The dataset path never calls update_env for these,
+            # so the shift reaches the env only here.
+            env.update_env(env_infos)
         obs, _ = env.prepare(seeds, init_states)
         rec(obs["visual"])
         obs_stack = deque([embed(obs["visual"])], maxlen=cfg.window_size)

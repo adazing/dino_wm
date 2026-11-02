@@ -3,6 +3,16 @@ args: []
 kwargs:
   with_velocity: true
   with_target: true
+  # Appearance shift (env/env_shift.py). null keeps the original rendering. Colours take
+  # anything pygame.Color accepts: a name, '#rrggbb', or an (r, g, b) tuple. `shape` is listed
+  # for completeness, but prefer eval_env_override.shape: update_env re-applies the dataset's
+  # recorded shape at eval and generation time and would overwrite this.
+  shape: null                 # T (trained) | L | Z | + | I | square | small_tee
+  color: null                 # pushed block, AdaJEPA "redBlock"; default LightSlateGray
+  agent_color: null           # circular pusher, AdaJEPA "redAgent"; default RoyalBlue
+  goal_color: null            # fixed anchor T, AdaJEPA "redAnchor"; default LightGreen
+  obs_corruption: null        # blur | snp1 | snp5 | dark
+  obs_corruption_level: null  # per-corruption default when null
 
 # action / goal / view dims for the BC policy
 act_dim: 2

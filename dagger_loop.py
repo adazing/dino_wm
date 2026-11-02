@@ -35,6 +35,33 @@ def _handle_stop(signum, frame):
     print("\n[dagger] stop requested, finishing the current step then exiting.", flush=True)
 
 
+def _shift_overrides(cfg):
+    """Hydra overrides that carry the test-time environment shift into every child process.
+
+    The shift has to reach BOTH the generation step (so the CEM planner plans in the shifted
+    environment) and the policy-training step (so the metric is measured there). Requiring the
+    user to repeat it in gen_overrides and train_overrides invites setting one and forgetting
+    the other, which produces a run whose planner and evaluator disagree about the world --
+    exactly the kind of silent confound that has cost this project whole arms before. So it is
+    one key here, forwarded to both.
+
+      eval_env_override  mapping, layout keys merged over the dataset's own env_info
+      env_kwargs         mapping, constructor kwargs (colours, shape, obs_corruption)
+    """
+    out = []
+    ovr = cfg.get("eval_env_override", None)
+    if ovr:
+        for k, v in dict(ovr).items():
+            if v is not None:
+                out.append(f"++eval_env_override.{k}={v}")
+    ekw = cfg.get("env_kwargs", None)
+    if ekw:
+        for k, v in dict(ekw).items():
+            if v is not None:
+                out.append(f"++env.kwargs.{k}={v}")
+    return out
+
+
 def _hy(v):
     """Render a Python value for a Hydra "++key=value" override.
 
@@ -480,7 +507,7 @@ def main(cfg):
                 cmd += [f"++env_start_method={cfg.env_start_method}"]
             cmd += _wandb_args(_run_name(f"r{r:02d}-gen-{tag}"),
                                "generate" if tag == "random" else "relabel")
-            cmd += extra + [str(o) for o in (cfg.get("gen_overrides") or [])]
+            cmd += extra + _shift_overrides(cfg) + [str(o) for o in (cfg.get("gen_overrides") or [])]
             rc, dt = _run(cmd, log_dir / f"round{r:02d}_gen_{tag}.log",
                           f"round {r}: generate ({tag}, {count} trajectories)",
                           summary_log=log_path)
@@ -534,7 +561,7 @@ def main(cfg):
             if cfg.get("env_start_method", None):
                 cmd += [f"++env_start_method={cfg.env_start_method}"]
             cmd += _wandb_args(_run_name(f"r{r:02d}-gen-measure"), "measure")
-            cmd += [str(o) for o in (cfg.get("gen_overrides") or [])]
+            cmd += _shift_overrides(cfg) + [str(o) for o in (cfg.get("gen_overrides") or [])]
             rc, _dt = _run(cmd, log_dir / f"round{r:02d}_gen_measure.log",
                            f"round {r}: measurement arm ({_n_probe} trajectories, not trained on)",
                            summary_log=log_path)
@@ -690,7 +717,7 @@ def main(cfg):
             f"++planned_selection={cfg.get('train_selection', 'first')}",
             # reseed the subset each round so 'random' selection actually resamples
             f"++planned_selection_seed={base_seed + r}",
-        ] + [str(o) for o in (cfg.get("train_overrides") or [])]
+        ] + _shift_overrides(cfg) + [str(o) for o in (cfg.get("train_overrides") or [])]
         # Per-arm policy-training scalars, appended AFTER train_overrides so they win over the
         # values baked into that list. `epochs` in particular is NOT comparable across
         # data_source settings: on planned-only data one epoch is a few hundred optimizer steps,

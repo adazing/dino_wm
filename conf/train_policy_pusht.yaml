@@ -170,3 +170,10 @@ hydra:
   run:
     # descriptive, unique per-run dir.
     dir: ./policy_outputs/${now:%Y%m%d%H%M%S}_${env.name}_${hydra:runtime.choices.encoder}_${hydra:runtime.choices.policy}_${data_source}_gc${goal_conditional}
+
+# Test-time environment shift: layout keys merged over the dataset's own per-trajectory
+# env_info, so evaluation can run in a different environment from the training data. Read by
+# env_shift.parse_override; {} means no shift. Appearance shifts are env.kwargs instead.
+# Requires eval_goal_render='env' (the default) -- with 'dataset' the goal picture would show
+# the unshifted world and train_policy refuses to run.
+eval_env_override: {}

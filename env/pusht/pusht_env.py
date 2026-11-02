@@ -379,9 +379,18 @@ class PushTEnv(gym.Env):
         with_target=True,
         shape="T",  # shape can be "T" <- the original shape, "I", "L", "Z", "square" and "small_tee"
         color="LightSlateGray",
-    ):  
+        agent_color="RoyalBlue",
+        goal_color=None,
+    ):
         self.shape = shape
         self.color = color
+        # Appearance knobs for AdaJEPA's visual shifts. `color` is the pushed block
+        # (redBlock), agent_color is the circular pusher (redAgent), goal_color is the fixed
+        # anchor T (redAnchor). Each takes anything pygame.Color accepts: a name, '#rrggbb',
+        # or an (r, g, b) tuple. goal_color=None keeps the with_target-dependent default, so
+        # an unconfigured env renders exactly as before.
+        self.agent_color = agent_color
+        self._goal_color_cfg = goal_color
         self._seed = None
         self.seed()
         self.window_size = ws = 512  # The size of the PyGame window
@@ -761,7 +770,9 @@ class PushTEnv(gym.Env):
         self.agent = self.add_circle((256, 400), 15)
         # self.block = self.add_tee((256, 300), 0)
         self.block = self.add_shape(self.shape, (256, 300), 0, color=self.color, scale=40)
-        if self.with_target:
+        if self._goal_color_cfg is not None:
+            self.goal_color = pygame.Color(self._goal_color_cfg)
+        elif self.with_target:
             self.goal_color = pygame.Color("LightGreen")
         else:
             self.goal_color = pygame.Color("White")
@@ -788,7 +799,9 @@ class PushTEnv(gym.Env):
         body.position = position
         body.friction = 1
         shape = pymunk.Circle(body, radius)
-        shape.color = pygame.Color("RoyalBlue")
+        # getattr, not self.agent_color, because add_circle is also reached from code paths
+        # that run before __init__ finishes on some subclasses.
+        shape.color = pygame.Color(getattr(self, "agent_color", None) or "RoyalBlue")
         self.space.add(body, shape)
         return body
 

@@ -13,6 +13,7 @@ from einops import rearrange
 from omegaconf import OmegaConf
 
 from utils import seed as set_seed
+from env import env_shift
 import train_policy as tp
 
 
@@ -91,6 +92,11 @@ def rollout_policy(cfg, encoder, policy, device, env, n_episodes, horizon, base_
     valid_base = getattr(traj_dset["valid"], "dataset", traj_dset["valid"])
     act_mean, act_std = valid_base.action_mean.numpy(), valid_base.action_std.numpy()
 
+    # Test-time environment shift, merged over the layout the dataset supplies.
+    env_override = env_shift.parse_override(cfg, cfg.env.name)
+    if env_override:
+        print(f"[rollout] env shift: {env_shift.describe(env_override)}")
+
     # wall, pin the maze before sampling init/goal, so the sampled states are valid for it.
     wall_fixed_info = None
     if cfg.env.name == "wall":
@@ -125,11 +131,12 @@ def rollout_policy(cfg, encoder, policy, device, env, n_episodes, horizon, base_
         seeds = [int(base_seed) + b * n_envs + i for i in range(n_envs)]
         if rs_mode:
             # env-sampled task.
-            if wall_fixed_info is not None:
-                env.update_env([wall_fixed_info] * n_envs)
+            _base = [wall_fixed_info] * n_envs if wall_fixed_info is not None else []
+            ep_env_infos = env_shift.apply_override(_base, env_override, n_envs)
+            if ep_env_infos:
+                env.update_env(ep_env_infos)
             init_states, goal_states = env.sample_random_init_goal_states(seeds)
             init_states, goal_states = np.asarray(init_states), np.asarray(goal_states)
-            ep_env_infos = [wall_fixed_info] * n_envs
             # render + embed the goal, prepare leaves the env AT the goal, so re-prepare to init
             # afterwards, same order plan.py and eval_on_env use
             goal_obs, _ = env.prepare(seeds, goal_states)
@@ -145,7 +152,8 @@ def rollout_policy(cfg, encoder, policy, device, env, n_episodes, horizon, base_
                 init_off.append(rng_i.randint(0, max(0, dset.get_seq_length(j) - goal_off - 1)))
             frames = [dset.get_frames(idxs[k], [init_off[k]]) for k in range(n_envs)]
             init_states = np.stack([np.asarray(f[2][0]) for f in frames])
-            ep_env_infos = [f[3] for f in frames]   # per-trajectory layout (wall), pusht, dict
+            # per-trajectory layout (wall) or shape (pusht), with the shift merged on top
+            ep_env_infos = env_shift.apply_override([f[3] for f in frames], env_override, n_envs)
             goal_idx = [min(init_off[k] + goal_off, dset.get_seq_length(idxs[k]) - 1)
                         for k in range(n_envs)]
             gframes = [dset.get_frames(idxs[k], [goal_idx[k]]) for k in range(n_envs)]
@@ -154,13 +162,24 @@ def rollout_policy(cfg, encoder, policy, device, env, n_episodes, horizon, base_
             # the encoder, running `tf` again (as embed() does for env renders) would be a second
             # resize.
             goal_emb = None
-            if int(cfg.env.goal_dim) > 0:
-                goal_imgs = torch.stack([g[0]["visual"][0] for g in gframes]).to(device)
-                goal_emb = encoder(goal_imgs).reshape(
-                    n_envs, 1, encoder.n_patches, encoder.emb_dim)
             # apply the per-trajectory layout before reset, so the goal and the rollout share it
             if all(e is not None for e in ep_env_infos):
                 env.update_env(ep_env_infos)
+            if int(cfg.env.goal_dim) > 0 and env_override:
+                # Under a shift the stored frame shows the UNSHIFTED environment, so the policy
+                # would chase a picture that contradicts its own observations. Redraw the goal
+                # at the same coordinates in the shifted env instead -- the goal STATES still
+                # come from the demonstration, so the task itself is unchanged. prepare() leaves
+                # the env at the goal, and the prepare() to init_states below moves it back.
+                goal_obs, _ = env.prepare(seeds, goal_states)
+                goal_emb = embed(np.asarray(goal_obs["visual"]))
+            elif int(cfg.env.goal_dim) > 0:
+                # dataset visuals are ALREADY transformed to [0,1] at img_size, so they go
+                # straight to the encoder, running `tf` again (as embed() does for env renders)
+                # would be a second resize.
+                goal_imgs = torch.stack([g[0]["visual"][0] for g in gframes]).to(device)
+                goal_emb = encoder(goal_imgs).reshape(
+                    n_envs, 1, encoder.n_patches, encoder.emb_dim)
 
         obs, state_0 = env.prepare(seeds, init_states)
         # per-step buffers for the episodes this batch will record, if any

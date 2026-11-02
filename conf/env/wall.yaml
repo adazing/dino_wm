@@ -5,6 +5,14 @@ args: []
 #   0  removes the guarantee, leaving only enough room to stay out of solid geometry.
 kwargs:
   sample_padding: null
+  # Appearance shift (env/env_shift.py). null keeps the original rendering exactly: the
+  # default-colour path in DotWall.channels_to_img is kept verbatim, so an unconfigured run is
+  # byte-identical to every previous one. Colours take 'red', '#rrggbb' or [r, g, b].
+  wall_color: null            # the bar, default black
+  agent_color: null           # the dot, default red
+  bg_color: null              # the field, default white
+  obs_corruption: null        # blur | snp1 | snp5 | dark
+  obs_corruption_level: null  # per-corruption default when null
 
 # action / goal / view dims for the BC policy
 act_dim: 2

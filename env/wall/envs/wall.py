@@ -10,6 +10,7 @@ from ..data.wall import WallDatasetConfig
 from ..data.wall_utils import generate_wall_layouts
 from .utils import check_wall_intersect
 from ..data.single import DotDataset
+from ...env_shift import parse_rgb
 
 
 class DotWall(gym.Env):
@@ -24,8 +25,23 @@ class DotWall(gym.Env):
         fix_door_location: Optional[int] = None,
         device="cpu",
         sample_padding: Optional[float] = None,
+        wall_color=None,
+        agent_color=None,
+        bg_color=None,
     ):
         super().__init__()
+        # Appearance. None keeps the original rendering, so an unconfigured env is unchanged.
+        # The defaults are what channels_to_img hardcoded: black bar, red dot, white field.
+        self.wall_color = parse_rgb(wall_color, (0, 0, 0))
+        self.agent_color = parse_rgb(agent_color, (255, 0, 0))
+        self.bg_color = parse_rgb(bg_color, (255, 255, 255))
+        # The original renderer is kept verbatim for the default palette rather than reusing
+        # the general blend below, because the two differ by one least-significant bit: the
+        # original truncates (dot_img * 255).to(uint8) while a blend rounds. Keeping the exact
+        # path means configuring no colours reproduces every previous run bit for bit.
+        self._default_colors = (self.wall_color == (0, 0, 0)
+                                and self.agent_color == (255, 0, 0)
+                                and self.bg_color == (255, 255, 255))
         self.wall_config = wall_config
         self.cross_wall = cross_wall
         self.level = level
@@ -54,12 +70,27 @@ class DotWall(gym.Env):
 
     def channels_to_img(self, wall_img, dot_img):
         h, w = wall_img.shape
+        wall_mask = wall_img == 1
+        no_wall_mask = wall_img == 0   # Mask where there are no walls
+
+        if not self._default_colors:
+            # General path: the dot image is an alpha map, so every non-wall pixel is a blend
+            # from the background colour toward the agent colour, and wall pixels are painted
+            # flat. With the default palette this reduces to the fast path below.
+            bg = torch.tensor(self.bg_color, dtype=torch.float32, device=self.device)
+            ag = torch.tensor(self.agent_color, dtype=torch.float32, device=self.device)
+            rgb = bg.view(3, 1, 1).expand(3, h, w).clone()
+            alpha = dot_img.to(torch.float32).clamp(0, 1)[no_wall_mask].unsqueeze(0)   # 1, K
+            rgb[:, no_wall_mask] = bg.view(3, 1) + (ag - bg).view(3, 1) * alpha
+            out = rgb.round().clamp(0, 255).to(torch.uint8)
+            out[:, wall_mask] = torch.tensor(
+                self.wall_color, dtype=torch.uint8, device=self.device).unsqueeze(1)
+            return out
+
         rgb_image = torch.ones((3, h, w), dtype=torch.uint8).to(self.device) * 255
 
-        wall_mask = wall_img == 1
         rgb_image[:, wall_mask] = torch.tensor([0, 0, 0], dtype=torch.uint8).to(self.device).unsqueeze(1)
 
-        no_wall_mask = wall_img == 0   # Mask where there are no walls
         red_intensity = (dot_img * 255).to(torch.uint8)
 
         rgb_image[1, no_wall_mask] = 255 - red_intensity[no_wall_mask]   # Green channel reduced

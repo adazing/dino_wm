@@ -375,3 +375,27 @@ num_pred: 1
 frameskip: 1
 normalize_action: true
 goal_conditional: true
+
+
+# --- test-time environment shift (see env/env_shift.py) -------------------------------
+# Both blocks are forwarded by dagger_loop._shift_overrides to the GENERATION step and the
+# POLICY-TRAINING step, so the CEM planner and the metric always see the same world. Set
+# them here, never in gen_overrides/train_overrides alone -- setting one and forgetting the
+# other produces a run whose planner and evaluator disagree, and nothing would flag it.
+#
+# LAYOUT shift. Merged on top of the per-trajectory env_info the dataset supplies, because
+# wall_dset.py:115 and pusht_dset.py:171 re-apply the recorded layout at eval time and would
+# otherwise overwrite a constructor kwarg.
+eval_env_override: {}
+#   eval_env_override:
+#     shape: I                  # T (trained) | L | Z | + | I | square | small_tee
+
+# APPEARANCE shift. Plain constructor kwargs, forwarded as ++env.kwargs.*, so they reach
+# every env the run creates -- planner, evaluator, rollouts and recorded videos alike.
+env_kwargs: {}
+#   env_kwargs:
+#     color: red                # pushed block, AdaJEPA "redBlock"
+#     agent_color: red          # circular pusher, AdaJEPA "redAgent"
+#     goal_color: red           # fixed anchor T, AdaJEPA "redAnchor"
+#     obs_corruption: blur      # blur | snp1 | snp5 | dark
+#     obs_corruption_level: 2.0 # optional, defaults per corruption

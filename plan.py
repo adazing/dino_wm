@@ -18,6 +18,7 @@ from einops import rearrange
 from omegaconf import OmegaConf, open_dict
 
 from env.venv import SubprocVectorEnv
+from env import env_shift
 from utils.custom_resolvers import replace_slash
 from utils.preprocessor import Preprocessor
 from planning.evaluator import PlanEvaluator
@@ -136,6 +137,13 @@ class PlanWorkspace:
         print("eval_seed: ", self.eval_seed)
         self.n_evals = cfg_dict["n_evals"]
         self.goal_source = cfg_dict["goal_source"]
+        # Test-time environment shift, merged over whatever layout the dataset supplies. All
+        # three goal_source branches below call update_env with data-derived env_info, so the
+        # override is applied at each of them -- that is the only way a shifted layout reaches
+        # the CEM planner during generation. None unless eval_env_override is set.
+        self.env_override = env_shift.parse_override(cfg_dict, env_name)
+        if self.env_override:
+            print(f"[plan] env shift: {env_shift.describe(self.env_override)}")
         self.goal_H = cfg_dict["goal_H"]
         self.action_dim = self.dset.action_dim * self.frameskip
         self.debug_dset_init = cfg_dict["debug_dset_init"]
@@ -211,7 +219,7 @@ class PlanWorkspace:
             observations, states, actions, env_info = (
                 self.sample_traj_segment_from_dset(traj_len=2)
             )
-            self.env.update_env(env_info)
+            self.env.update_env(env_shift.apply_override(env_info, self.env_override, self.n_evals))
 
             # sample random states
             rand_init_state, rand_goal_state = self.env.sample_random_init_goal_states(
@@ -237,7 +245,7 @@ class PlanWorkspace:
             # init/goal states supplied by the caller, used by generate_planned_trajectories.py
             # for controlled selection / plan_to_end.
             env_info = self.cfg_dict["env_info"]
-            self.env.update_env(env_info)
+            self.env.update_env(env_shift.apply_override(env_info, self.env_override, self.n_evals))
             init_state = np.asarray(self.cfg_dict["init_states"])
             goal_state = np.asarray(self.cfg_dict["goal_states"])
             obs_0, state_0 = self.env.prepare(self.eval_seed, init_state)
@@ -259,7 +267,7 @@ class PlanWorkspace:
                     offsets=self.cfg_dict.get("offsets"),
                 )
             )
-            self.env.update_env(env_info)
+            self.env.update_env(env_shift.apply_override(env_info, self.env_override, self.n_evals))
 
             # get states from val trajs
             init_state = [x[0] for x in states]

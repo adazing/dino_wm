@@ -3,18 +3,47 @@ import numpy as np
 import gym
 from env.pusht.pusht_env import PushTEnv
 from utils import aggregate_dct
+from env.env_shift import corrupt_visual
 
 class PushTWrapper(PushTEnv):
     def __init__(
-            self, 
+            self,
             with_velocity=True,
             with_target=True,
+            obs_corruption=None,
+            obs_corruption_level=None,
+            **kwargs,
         ):
+        # **kwargs forwards PushTEnv's own appearance arguments -- shape, color, agent_color,
+        # goal_color -- which this wrapper previously swallowed, so `env.kwargs.shape=I` was
+        # silently ignored and every env rendered a T.
+        #
+        # None-valued entries are DROPPED rather than forwarded. conf/env/pusht.yaml lists these
+        # keys as null to document them, and null has to mean "keep the default": forwarding
+        # shape=None would set self.shape = None and crash add_shape, and color=None would reach
+        # pygame.Color(None). Dropping them makes null mean here what it already means for wall,
+        # where parse_rgb(None, default) resolves to the default.
+        kwargs = {k: v for k, v in kwargs.items() if v is not None}
         super().__init__(
             with_velocity=with_velocity,
-            with_target=with_target, 
+            with_target=with_target,
+            **kwargs,
         )
         self.action_dim = self.action_space.shape[0]
+        # Observation corruption. pusht renders straight at render_size with no resize after,
+        # so this is already the frame the encoder sees. None = unchanged.
+        self.obs_corruption = None if obs_corruption in (None, "none") else str(obs_corruption)
+        self.obs_corruption_level = obs_corruption_level
+        self._corrupt_seed = 0
+        self._corrupt_tick = 0
+
+    def _corrupt(self, visual):
+        """Apply the configured observation corruption to one (H, W, C) frame."""
+        if self.obs_corruption is None:
+            return visual
+        self._corrupt_tick += 1
+        return corrupt_visual(visual, self.obs_corruption, self.obs_corruption_level,
+                              seed=self._corrupt_seed + self._corrupt_tick)
     
     def sample_random_init_goal_states(self, seed):
         """
@@ -52,7 +81,15 @@ class PushTWrapper(PushTEnv):
         return init_state, goal_state
     
     def update_env(self, env_info):
-        self.shape = env_info['shape']
+        # `shape` is what pusht_dset.py:171 supplies per trajectory. The appearance keys are
+        # optional and only present when eval_env_override sets them; they take effect at the
+        # next reset(), where the block, pusher and anchor are rebuilt.
+        if 'shape' in env_info:
+            self.shape = env_info['shape']
+        for key, attr in (('color', 'color'), ('agent_color', 'agent_color'),
+                          ('goal_color', '_goal_color_cfg')):
+            if env_info.get(key) is not None:
+                setattr(self, attr, env_info[key])
     
     def eval_state(self, goal_state, cur_state):
         """
@@ -85,8 +122,14 @@ class PushTWrapper(PushTEnv):
         state: (state_dim)
         """
         self.seed(seed)
+        # Tie the corruption RNG to the episode seed and restart its counter, so a rerun of
+        # the same episode draws the same noise and the metric is reproducible.
+        self._corrupt_seed = int(np.asarray(seed).reshape(-1)[0]) if np.size(seed) else 0
+        self._corrupt_tick = 0
         self.reset_to_state = init_state
         obs, state = self.reset()
+        if isinstance(obs, dict) and "visual" in obs:
+            obs["visual"] = self._corrupt(obs["visual"])
         return obs, state
 
     def step_multiple(self, actions):
@@ -99,6 +142,8 @@ class PushTWrapper(PushTEnv):
         infos = []
         for action in actions:
             o, r, d, info = self.step(action)
+            if isinstance(o, dict) and "visual" in o:
+                o["visual"] = self._corrupt(o["visual"])
             obses.append(o)
             rewards.append(r)
             dones.append(d)
