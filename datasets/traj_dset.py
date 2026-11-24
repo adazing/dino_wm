@@ -62,6 +62,7 @@ class TrajSlicerDataset(TrajDataset):
         num_frames: int,
         frameskip: int = 1,
         process_actions: str = "concat",
+        slice_seed: Optional[int] = None,
     ):
         self.dataset = dataset
         self.num_frames = num_frames
@@ -69,15 +70,27 @@ class TrajSlicerDataset(TrajDataset):
         self.slices = []
         for i in range(len(self.dataset)):
             T = self.dataset.get_seq_length(i)
-            if T - num_frames < 0:
-                print(f"Ignored short sequence #{i}: len={T}, num_frames={num_frames}")
+            # B19, fixed 2026-11-24. The guard tested T - num_frames while the slice list below
+            # needs T - num_frames * frameskip. With frameskip 5 and num_frames 4 a 10-frame
+            # trajectory passed the guard (10 - 4 >= 0) and then produced range(10 - 20 + 1),
+            # i.e. NO slices, silently. The message said nothing was ignored while the data
+            # vanished.
+            if T - num_frames * self.frameskip < 0:
+                print(f"Ignored short sequence #{i}: len={T}, "
+                      f"needs num_frames*frameskip={num_frames * self.frameskip}")
             else:
                 self.slices += [
                     (i, start, start + num_frames * self.frameskip)
                     for start in range(T - num_frames * frameskip + 1)
                 ]   # slice indices follow convention [start, end)
-        # randomly permute the slices
-        self.slices = np.random.permutation(self.slices)
+        # B19 part 1, fixed 2026-11-24. This was np.random.permutation on numpy's GLOBAL rng, so
+        # the window order -- and therefore WHICH windows a cap keeps, since a cap takes a prefix
+        # -- depended on whatever had consumed the global stream earlier in the process. That made
+        # every world-model data mix irreproducible. slice_seed=None now means the fixed default 0,
+        # NOT unseeded, so every caller is reproducible by default; train.py passes the run seed so
+        # arms still differ from each other.
+        _rng = np.random.default_rng(0 if slice_seed is None else int(slice_seed))
+        self.slices = _rng.permutation(self.slices)
 
         self.proprio_dim = self.dataset.proprio_dim
         if process_actions == "concat":

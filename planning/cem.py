@@ -169,23 +169,15 @@ class CEMPlanner(BasePlanner):
             )
             if all(done):
                 break   # every trajectory converged -> stop optimizing early
-            if self.evaluator is not None and self.eval_every is not None and i % self.eval_every == 0:
-                # per-trajectory real-success check, roll the current plan out in the ENV and
-                # freeze any trajectory the env confirms reached the goal, so it stops costing
-                # rollouts.
-                with torch.no_grad():
-                    logs, successes, _, _ = self.evaluator.eval_actions(
-                        mu, save_plot=self.eval_save_plot, save_video=False,
-                        filename=f"{self.logging_prefix}_output_{i+1}"
-                    )
-                logs = {f"{self.logging_prefix}/{k}": v for k, v in logs.items()}
-                logs.update({"step": self.log_step_offset + i + 1})
-                self.wandb_run.log(logs)
-                self.dump_logs(logs)
-                for j in range(n_evals):
-                    if successes[j]:
-                        done[j] = True   # env-confirmed success -> freeze this trajectory
-                if all(done):
-                    break   # every trajectory reached the goal -> stop planning
+            # REMOVED 2026-11-23 (M3): the search used to roll the current plan out in the real
+            # ENVIRONMENT every eval_every opt steps and freeze any trajectory the environment
+            # confirmed had reached the goal. With eval_every: 1 and opt_steps: 30 that is up to 30
+            # real rollouts per task, so the planner was consulting the simulator to decide when it
+            # was done -- the plan that gets saved was then shaped by ground truth the planner is
+            # not supposed to have. Generation is slower without it, which is accepted. The
+            # imagined-objective freezes above (stop_loss_thresh, patience) stay: those read the
+            # world model's own prediction and cost nothing. `evaluator` and `eval_every` remain
+            # constructor arguments because plan.py passes them by keyword; neither is read here
+            # any more.
 
         return mu, np.full(n_evals, np.inf)   # all actions are valid

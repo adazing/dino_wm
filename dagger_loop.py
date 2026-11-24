@@ -220,7 +220,28 @@ def _pick_ckpt(cfg, ckpt_dir):
     when use_best_checkpoint is false, when select_metric is unset, and for rounds that were trained
     before best-tracking existed.
     """
-    if bool(cfg.get("use_best_checkpoint", True)):
+    # policy_ckpt_select, the single key controlling this since use_best_checkpoint was removed
+    # 2026-11-24 (E2):
+    #   "avg"   -> checkpoints/model_avg.pt, the weight average. No selector at all, so no leak.
+    #   "best"  -> checkpoints/model_best.pt, whatever select_metric chose. A rollout metric here
+    #              is M2's leak; an offline metric here is only as good as its correlation with
+    #              success, measured at Spearman -0.31 for the action loss.
+    #   "final" -> checkpoints/model_final.pt, the last epoch, no selection.
+    # Each falls back to model_final.pt when its file is absent.
+    if "use_best_checkpoint" in cfg:
+        raise ValueError(
+            "use_best_checkpoint was removed 2026-11-24 (E2). It selected the policy checkpoint by "
+            "simulator rollout, which is M2's leak. Use policy_ckpt_select: avg | best | final.")
+    _mode = str(cfg.get("policy_ckpt_select", None) or "final").lower()
+    if _mode not in ("avg", "best", "final"):
+        raise ValueError(f"policy_ckpt_select must be avg|best|final, got {_mode!r}")
+    if _mode == "avg":
+        avg = ckpt_dir / "model_avg.pt"
+        if avg.is_file():
+            return avg
+        print("[dagger] policy_ckpt_select=avg but no model_avg.pt; is policy_weight_avg set? "
+              "falling back to model_final.pt")
+    elif _mode == "best":
         best = ckpt_dir / "model_best.pt"
         if best.is_file():
             return best
@@ -550,10 +571,27 @@ def main(cfg):
                 "++planned_out_path=./planned",
                 f"++shard_every={int(cfg.shard_every)}",
                 f"++num_trajectories={_n_probe}",
-                "++goal_source=random_state",
-                f"++seed={base_seed + 777 + r * 10_000}",
-                f"++eval_seed_base={base_seed + 777 + r * 10_000}",
             ]
+            # The task source. Previously this HARDCODED goal_source=random_state, which is
+            # correct for wall -- its generation config already uses it -- but wrong for pusht,
+            # whose generation uses goal_source=dset (the valid demo split) and for which
+            # random_state has been ruled out. Leaving measure_goal_source null means the arm uses
+            # whatever its own gen config uses, so each environment measures itself on the task
+            # family it is actually trained for. Set it explicitly only to override that.
+            _m_src = cfg.get("measure_goal_source", None)
+            if _m_src:
+                cmd += [f"++goal_source={_m_src}"]
+            # FIXED TASKS, which is the point of this arm. The seed used to advance per round
+            # (base_seed + 777 + r*10_000), so every round drew DIFFERENT tasks from the same
+            # distribution -- the difficulty was stable only in expectation, and with 10 tasks the
+            # sampling noise swamped the signal (standard error about 0.16 near a rate of 0.5).
+            # Pinning the seed runs the IDENTICAL tasks every round, so a round-to-round
+            # comparison is paired rather than independent and the same n resolves far more.
+            # 100777 stays clear of generation (base_seed + r*10_000, plus up to ~150 per round)
+            # and of scouting (base_seed + r*100_000).
+            _m_seed = (base_seed + 777 if bool(cfg.get("measure_fixed_tasks", True))
+                       else base_seed + 777 + r * 10_000)
+            cmd += [f"++seed={_m_seed}", f"++eval_seed_base={_m_seed}"]
             if override_dataset_path:
                 cmd += [f"++override_dataset_path={override_dataset_path}"]
             if bool(cfg.get("serial_env", False)):
@@ -617,16 +655,12 @@ def main(cfg):
                 f"++training.epochs={int(cfg.get('wm_finetune_epochs', 5))}",
                 f"++planned_data_path={pool_dir}",
                 # three independent window caps: null = all, 0 = exclude the group, N = N windows
-                # planner  -> success / failure groups (did the PLANNER reach the goal)
-                # wm_error -> wm_ok / wm_fail groups (did the WORLD MODEL mispredict), threshold
-                #             recomputed from this round's pool at wm_finetune_err_pct
-                f"++planned_split={cfg.get('wm_planned_split', 'planner')}",
+                # The planned groups are success / failure, on whether the PLANNER reached the
+                # goal. The wm_ok / wm_fail alternative was removed 2026-11-24 (M5).
                 f"++max_demo_windows={_hy(cfg.get('wm_max_demo_windows', None))}",
                 f"++max_rollout_windows={_hy(cfg.get('wm_max_rollout_windows', None))}",
                 f"++max_success_windows={_hy(cfg.get('wm_max_success_windows', None))}",
                 f"++max_failure_windows={_hy(cfg.get('wm_max_failure_windows', None))}",
-                f"++max_wm_ok_windows={_hy(cfg.get('wm_max_wm_ok_windows', None))}",
-                f"++max_wm_fail_windows={_hy(cfg.get('wm_max_wm_fail_windows', None))}",
                 # the policy's recorded scouting episodes, written by _collect_states when
                 # rollout_record_episodes > 0. Cumulative across rounds.
                 f"++rollout_data_path={out_dir / 'rollout_pool'}",
@@ -637,10 +671,6 @@ def main(cfg):
                 f"++frac_rollout={_hy(cfg.get('wm_frac_rollout', None))}",
                 f"++frac_success={_hy(cfg.get('wm_frac_success', None))}",
                 f"++frac_failure={_hy(cfg.get('wm_frac_failure', None))}",
-                f"++frac_wm_ok={_hy(cfg.get('wm_frac_wm_ok', None))}",
-                f"++frac_wm_fail={_hy(cfg.get('wm_frac_wm_fail', None))}",
-                # orthogonal filter on the two planned groups
-                f"++planned_wm_err_pct={float(cfg.get('wm_finetune_err_pct', 50.0))}",
                 # which windows a cap keeps; varied per round so successive fine-tunes anchor
                 # against different demo data instead of one fixed subset
                 f"++window_subset_seed={base_seed + r}",
@@ -669,14 +699,14 @@ def main(cfg):
             if rc != 0:
                 raise RuntimeError(f"round {r} world-model fine-tune failed with exit {rc}, see "
                                    f"{log_dir / f'round{r:02d}_wm.log'}")
-            # Carry the fine-tune's BEST epoch forward, not its last. On wall every round of
-            # every fine-tuning arm reported val_loss_best_epoch == 1, so handing the last epoch
-            # forward meant adopting the worst of the five just produced.
-            _wm_best = wm_run / "checkpoints" / "model_best.pth"
-            _use_best = bool(cfg.get("wm_use_best_checkpoint", True)) and _wm_best.is_file()
-            wm_base, wm_name, wm_epoch = str(rdir), "wm", ("best" if _use_best else "latest")
-            print(f"[dagger] round {r}: carrying forward model_{wm_epoch}.pth"
-                  + ("" if _use_best else "  (no model_best.pth; using the last epoch)"))
+            # The fine-tune's LAST epoch is carried forward, unconditionally. Selecting a
+            # "best" epoch by the world model's validation loss was removed 2026-11-23 (M1):
+            # that validation set is dominated by demonstration windows, so a fine-tune that
+            # improved the states the planner actually visits while costing a little on
+            # demonstrations was rejected, which turned every fine-tune into a no-op. The
+            # per-epoch loss curve is still written to wm_metrics.json for diagnosis.
+            wm_base, wm_name, wm_epoch = str(rdir), "wm", "latest"
+            print(f"[dagger] round {r}: carrying forward model_{wm_epoch}.pth")
             _wm_log = {"wm/finetuned": 1, "wm/finetune_seconds": dt}
             # how much data the fine-tune actually saw, written by train.py
             _dc = wm_run / "data_counts.json"
@@ -829,10 +859,22 @@ def main(cfg):
                     for _k, _v in _row.items():
                         if _k.startswith("policy_"):
                             _lg[f"relabel/{_k}"] = _v
-                    _h = str(cfg.get("relabel_eval_horizons", "25,300")).split(",")[0]
+                    _hs = [h.strip() for h in
+                           str(cfg.get("relabel_eval_horizons", "25,300")).split(",") if h.strip()]
+                    _h = _hs[0] if _hs else "25"
                     _pm = _row.get(f"policy_max_success_h{_h}")
                     if _pl is not None and _pm is not None:
                         _lg["relabel/gap"] = _pl - _pm   # how much better the expert still is
+                    # Every horizon, not just the first. The longer horizons were computed and
+                    # written to relabel_eval.json but never logged, so the only way to see them
+                    # was to open the file by hand. relabel/gap still uses the FIRST horizon, the
+                    # one matching the planner's own budget, so its meaning is unchanged.
+                    for _hh in _hs:
+                        _v = _row.get(f"policy_max_success_h{_hh}")
+                        if _v is not None:
+                            _lg[f"relabel/policy_max_success_h{_hh}"] = _v
+                            if _pl is not None:
+                                _lg[f"relabel/gap_h{_hh}"] = _pl - _v
                     _loop_log(_lg, r)
                     print(f"[dagger] round {r}: on the planner's {_row.get('n_states')} states, "
                           f"planner={_pl} policy@h{_h}={_pm}")

@@ -83,11 +83,38 @@ def _to_uint8_visual(arr):
     return t
 
 
-def _pad_actions_to(act, length):
-    """Pad (T, A) to (length, A) by repeating the last action."""
+def _pad_actions_to(act, length, max_pad=1):
+    """Pad (T, A) to (length, A) by repeating the last action.
+
+    B13. A rollout of N planned actions returns N+1 frames, so the action array is ONE row short
+    of the frame count and this pads it with a copy of the final action. That padded row
+    corresponds to no executed transition: it is fabricated, and the convention it violates is
+    stated at the "A stored trajectory has T frames covering T-1 executed env actions" comment
+    below.
+
+    Verified 2026-11-24 that nothing currently consumes it:
+      * the POLICY cannot reach it. After B1's slice filter the highest surviving window end on a
+        26-frame trajectory is 19, and the slicer reads actions up to
+        min(end - 1 + action_window, T) = 23.
+      * the WORLD MODEL encodes it but never trains on it. The fabricated row lands in the final
+        super-frame, which appears only in z_tgt, and every loss term in
+        models/visual_world_model.py slices the action channels off z_tgt
+        (z_pred[..., :-action_dim] against z_tgt[..., :-action_dim], and the concat_dim == 0 branch
+        drops the action token with [:, :, :-1, :]).
+    So this is a latent trap rather than a live defect, and the loaders are deliberately left
+    alone. max_pad asserts the shortfall is the single expected row -- a larger gap would mean the
+    action and frame counts have genuinely desynchronised, which is a different and real bug.
+    """
     if act.shape[0] >= length:
         return act[:length]
-    pad = act[-1:].repeat(length - act.shape[0], 1)
+    n_pad = length - act.shape[0]
+    if n_pad > max_pad:
+        raise ValueError(
+            f"action array is {n_pad} rows short of the {length} frames, expected at most "
+            f"{max_pad}. A rollout of N actions should return N+1 frames, so a gap of more than "
+            f"one row means the actions and frames have desynchronised. See CODE_AUDIT-adaBot.md "
+            f"B13.")
+    pad = act[-1:].repeat(n_pad, 1)
     return torch.cat([act, pad], dim=0)
 
 

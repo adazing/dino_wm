@@ -111,7 +111,7 @@ gen_config_name: gen_pusht_dset
 # planner=cem is now also gen_pusht_dset.yaml's default, so this is belt-and-braces. With n_taken_actions 5 = horizon 5, mpc_cem
 # is just cem plus retries at up to 4x the cost, and it changed a second thing at once. Plain cem
 # solved 0.85 of demo goals in round 0 of earlier runs; the low rate was on the hard relabel states.
-gen_overrides: ["planner=cem"]
+gen_overrides: []   # planner=cem is already the default in conf/gen_pusht_dset.yaml
 shard_every: 5
 
 # Run every env in this process instead of forked subprocesses. Slower but avoids EGL failures under fork.
@@ -191,7 +191,6 @@ wm_train_config_name: train_pusht
 #             model redefines its own failures. Harmless while both caps are null (nothing is
 #             excluded); only bites when you use the split to drop a group.
 #             -> wm_max_wm_ok_windows / wm_max_wm_fail_windows
-wm_planned_split: planner
 
 # --- mode-independent groups -----------------------------------------------------------------
 # Demonstrations. 0 here is the old wm_finetune_data_source: planned.
@@ -204,13 +203,9 @@ wm_max_demo_windows: null
 # that could be right or wrong, and no planner outcome either.
 wm_max_rollout_windows: null
 
-# --- planned groups, wm_planned_split: planner -----------------------------------------------
+# --- planned groups --------------------------------------------------------------------------
 wm_max_success_windows: null
 wm_max_failure_windows: null
-
-# --- planned groups, wm_planned_split: wm_error ----------------------------------------------
-wm_max_wm_ok_windows: null
-wm_max_wm_fail_windows: null
 
 # --- proportional mode for the world-model fine-tune --------------------------------------
 # The caps above fix each group's SIZE; the MIX is whatever the pool happens to hold. Measured
@@ -226,13 +221,7 @@ wm_frac_demo: null
 wm_frac_rollout: null
 wm_frac_success: null
 wm_frac_failure: null
-wm_frac_wm_ok: null
-wm_frac_wm_fail: null
 
-
-# The percentile that divides wm_ok from wm_fail. Recomputed from the current pool every round,
-# so "50" always means the worse half of THIS round's data. Only read in wm_error mode.
-wm_finetune_err_pct: 50
 wm_finetune_epochs: 5
 # Which checkpoint each round's fine-tune STARTS from.
 #   chain  the previous round's fine-tuned world model. Drift compounds across rounds: measured on
@@ -246,7 +235,20 @@ wm_finetune_from: chain
 # Carry the fine-tune's BEST epoch forward rather than its last, selected on the world model's
 # validation loss. On wall every round of every fine-tuning arm reported val_loss_best_epoch ==
 # 1, so the loop was adopting the worst of five epochs. false restores the old behaviour.
-wm_use_best_checkpoint: true
+# wm_use_best_checkpoint was REMOVED 2026-11-23 (M1). The fine-tune's last epoch is always
+# carried forward now. The flag selected the epoch with the lowest world-model validation loss,
+# but that validation set is dominated by demonstration windows, so it rejected every fine-tune
+# that helped the states the planner actually visits at a small cost on demonstrations. On wall
+# every round of every fine-tuning arm reported val_loss_best_epoch == 1, which the selector read
+# as "the fine-tune only hurt" and the loop then turned into a no-op.
+#
+# WORTH REVISITING, NOT YET WORTH BUILDING: a planned-valid split would give a selection signal
+# that is actually about the right distribution -- hold out planner-generated wall trajectories
+# and select the epoch with the lowest prediction error on those. The pieces exist, since the
+# pool already stores failures alongside successes. Two reasons it is parked: the held-out set
+# would be resampled from a growing pool each round, so the number is not comparable round to
+# round, and the literature on checkpoint selection (see CODE_AUDIT Part 14) finds offline loss
+# a weak predictor of downstream success even when the distribution is right.
 # null keeps the learning rates in the world-model training config.
 wm_finetune_lr: 1e-5
 # Restrict the world-model fine-tune to the predictor's LAST transformer block plus its final norm
@@ -261,21 +263,30 @@ wm_finetune_last_layer_only: true
 # Forced on by wm_finetune_last_layer_only. false restores the old trainable behaviour.
 wm_finetune_freeze_encoders: true
 
-
 # After each round, score the freshly trained policy on the SAME (init, goal) pairs the planner was
 # handed. The planner's rate is measured on the policy's own failures, which get harder every round,
 # so it cannot be read against the policy's goal25 passes at fixed difficulty. This puts both on
 # identical problems. Costs a few GPU-minutes per round. Logged to the loop run as relabel/*.
 # Hand the next round model_best.pt (best select_metric during the round) rather than
 # model_final.pt (the last epoch). false restores the old last-epoch behaviour.
-use_best_checkpoint: true
 # Fixed-difficulty world-model yardstick: N fresh random tasks per round, never trained on,
 # solved by the planner using THIS round's world model. The planner is a fixed search procedure,
 # so the only thing that can move this score is the world model -- which is how wall showed its
 # fine-tune driving the planner 9/10 -> 0/10 over three rounds. Without it a falling planner score
 # is ambiguous between a dying world model and harder relabel states. 0 = off.
 # WAS MISSING from this file entirely, so no pusht run has ever had a world-model yardstick.
-measure_random_trajectories: 10
+# A measurement-only arm: plans this many extra trajectories per round on a FIXED task set, never
+# absorbed into the training pool. It exists because the relabel arm's difficulty rises every round
+# as the policy improves, so planner success there cannot be compared across rounds; this can.
+# Raised from 10 to 30 on 2026-11-24 (E8): at n=10 the standard error on a rate near 0.5 is about
+# 0.16, which is why M7 could not resolve 0.856 against 0.811.
+measure_random_trajectories: 30
+# null = use this environment's own generation goal_source, which is what you want: random_state
+# for wall, dset (the valid demo split) for pusht. Set a value only to override that.
+measure_goal_source: null
+# true = the same tasks every round, so round-to-round comparison is paired. Was effectively false
+# before 2026-11-24, which is where most of the noise came from.
+measure_fixed_tasks: true
 eval_policy_on_relabel: true
 # Env-step budgets for that eval; the first is what the gap is computed from.
 #   25   the planner's own budget, goal_H * frameskip. The fair head-to-head.
@@ -330,9 +341,14 @@ train_overrides:
   - policy=vqbet
   - goal_conditional=true
   - future_conditional=true
-  # false, not true. Discarding the ~70% of planned trajectories that missed threw away the
-  # planner's best attempt at each goal, which goal-conditioned BC still learns from, and
-  # biased training toward easy cases. Keeping them roughly triples the data per round.
+  # B5, resolved 2026-11-24. This comment used to argue for `false` while the line below it set
+  # `true`, so one of the two was a leftover and the config contradicted itself. The decision is
+  # `true`, and the comment is the leftover. The argument for `false` -- that a failed plan is still
+  # the planner's best attempt and that keeping them roughly triples the data -- does not hold for
+  # this consumer: VQ-BeT is behaviour cloning, so a trajectory that missed its goal teaches the
+  # policy to miss. Failures are legitimately useful to the WORLD MODEL, which learns dynamics and
+  # does not care whether the goal was reached, and that is a separate data path with its own
+  # wm_frac_failure control.
   - planned_only_successes=true
   - seed=42
   - batch_size=16
@@ -360,9 +376,26 @@ train_overrides:
   - eval_horizon=300
   - save_eval_video=true
   - n_eval_videos=10
+  # ADDED 2026-11-24: wall set this and pusht did not, with no reason for the difference.
+  - eval_video_fps=12
   - wandb_logging=true
   # pusht HAS a coverage task, unlike wall, so the task pass is included here.
-  - 'eval_passes=[{name:goal25_valid,type:goal,goal_offset:25,horizon:300,goal_source:valid},{name:goal25_train,type:goal,goal_offset:25,horizon:300,goal_source:train},{name:task,type:task,horizon:300,goal_source:valid}]'
+  # Pusht eval passes. CHANGED 2026-11-24 (M11): goal25_valid ONLY.
+  #
+  # Pusht generates its training data with goal_source: dset, i.e. from the valid demo split, so
+  # goal25_valid is the matching task family and stays THE REPORTED METRIC. It has no reach_rs
+  # equivalent: env/pusht/pusht_wrapper.py:48-70 draws init and goal INDEPENDENTLY from the same
+  # uniform distribution, so a random_state pair is arbitrary rather than a task, which is why
+  # that mode is ruled out for pusht.
+  #
+  # goal25_train is DISABLED. It was kept for X1, which tried to size the pusht leak from the
+  # valid-minus-train gap; that method was falsified on 2026-11-24 (the gap moved the wrong way,
+  # see X1), so the pass no longer has a consumer. Sizing the leak now needs a dedicated arm with
+  # goal_source: train.
+  #
+  # Support is intact. To restore it, add back:
+  #   {name:goal25_train,type:goal,goal_offset:25,horizon:300,goal_source:train}
+  - 'eval_passes=[{name:goal25_valid,type:goal,goal_offset:25,horizon:300,goal_source:valid}]'
 
 # --- policy-side settings, must match the checkpoint being scouted -------------------------
 n_envs: 10
@@ -375,7 +408,6 @@ num_pred: 1
 frameskip: 1
 normalize_action: true
 goal_conditional: true
-
 
 # --- test-time environment shift (see env/env_shift.py) -------------------------------
 # Both blocks are forwarded by dagger_loop._shift_overrides to the GENERATION step and the
@@ -399,3 +431,12 @@ env_kwargs: {}
 #     goal_color: red           # fixed anchor T, AdaJEPA "redAnchor"
 #     obs_corruption: blur      # blur | snp1 | snp5 | dark
 #     obs_corruption_level: 2.0 # optional, defaults per corruption
+
+# Which checkpoint each round hands to the next: avg | best | final. Outranks use_best_checkpoint.
+#   avg   -> checkpoints/model_avg.pt, requires policy_weight_avg in the train_policy config.
+#            No selector, so no selection leak and no proxy to validate. The recommended route.
+#   best  -> model_best.pt, chosen by select_metric. With a rollout metric this is M2's leak.
+#   final -> model_final.pt, the last epoch.
+#   final -> model_final.pt, the last epoch. THE DEFAULT since 2026-11-24 (E2), because it
+#            involves no selection and so carries no selection leak.
+policy_ckpt_select: final

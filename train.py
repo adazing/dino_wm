@@ -247,16 +247,10 @@ class Trainer:
     def _build_capped_train_set(self):
         """Build datasets['train'] from up to FOUR independently capped groups.
 
-        Groups. Which two PLANNED groups exist depends on planned_split:
+        Groups:
           demo      the demonstration windows
-          planned_split=planner   (default)
-            success   planned trajectories where the PLANNER reached its goal
-            failure   planned trajectories where it did not
-          planned_split=wm_error
-            wm_fail   planned trajectories whose endpoint the WORLD MODEL mispredicted, at the
-                      planned_wm_err_pct percentile of THIS pool -- recomputed every round, so it
-                      moves as the model changes
-            wm_ok     the complement
+          success   planned trajectories where the PLANNER reached its goal
+          failure   planned trajectories where it did not
           rollout   the POLICY's own scouting episodes, recorded when
                     rollout_record_episodes > 0. Dynamics do not care who chose the action, so a
                     failed policy episode is valid world-model data -- and it is exactly where
@@ -299,24 +293,19 @@ class Trainer:
         _p_mean, _p_std = _demo_proprio_stats()
 
         split = str(self.cfg.get("planned_split", "planner")).lower()
-        if split not in ("planner", "wm_error"):
-            raise ValueError(f"planned_split must be 'planner' or 'wm_error', got {split!r}")
+        if split != "planner":
+            raise ValueError(
+                f"planned_split must be 'planner', got {split!r}. The 'wm_error' mode was "
+                f"removed 2026-11-24; see CODE_AUDIT-adaBot.md M5.")
         # Which two planned groups this mode uses, and the planned_dset filter for each.
         # The demo and rollout groups are mode-independent: demonstrations have no planner
         # outcome, and policy rollouts have no world-model prediction (the policy never runs the
         # world model), so neither can be split either way.
-        PLANNED_GROUPS = {
-            "planner":  {"success": ("all", True), "failure": ("policy_fail", False)},
-            "wm_error": {"wm_fail": ("wm_fail", False), "wm_ok": ("wm_ok", False)},
-        }
-        sel_of = PLANNED_GROUPS[split]
-        inactive = set().union(*(set(v) for v in PLANNED_GROUPS.values())) - set(sel_of)
-        for g in sorted(inactive):
-            if self.cfg.get(f"max_{g}_windows", None) is not None:
-                raise ValueError(
-                    f"max_{g}_windows is set but planned_split={split!r} does not use that "
-                    f"group. Its groups are {sorted(sel_of)}. Leave max_{g}_windows null, or "
-                    f"switch planned_split.")
+        # The wm_error alternative -- splitting on whether the WORLD MODEL mispredicted the
+        # endpoint, at a percentile of the current pool -- was removed 2026-11-24 (M5): the
+        # threshold moved every round, and the split was measured to be a near-restatement of
+        # planner success/failure. planned_split therefore has only one value.
+        sel_of = {"success": ("all", True), "failure": ("policy_fail", False)}
 
         caps = {"demo": _cap_of("max_demo_windows"),
                 "rollout": _cap_of("max_rollout_windows")}
@@ -362,7 +351,6 @@ class Trainer:
                      + ", ".join(f"{g}={_fr[g]:.2f}" for g in _active)
                      + " -> caps " + ", ".join(f"{g}={caps[g]}" for g in _active))
 
-        err_pct = float(self.cfg.get("planned_wm_err_pct", 50.0))
         seed = int(self.cfg.get("window_subset_seed", self.cfg.training.seed))
 
         def _subset(ds, cap, label):
@@ -409,7 +397,7 @@ class Trainer:
                 try:
                     dset = PlannedTrajDataset(
                         planned_path, transform=default_transform(self.cfg.img_size),
-                        select=select, only_successes=only_succ, wm_err_pct=err_pct,
+                        select=select, only_successes=only_succ,
                         max_trajectories=self.cfg.get("planned_max_trajectories", None),
                         selection=str(self.cfg.get("planned_selection", "first")),
                         selection_seed=int(self.cfg.get("planned_selection_seed",
@@ -426,7 +414,8 @@ class Trainer:
                 # TrajSlicerDataset permutes with the GLOBAL numpy RNG. Restore the stream or a
                 # fine-tune diverges from a plain train run started with the same seed.
                 st = np.random.get_state()
-                sl = TrajSlicerDataset(dset, n_frames, self.cfg.frameskip)
+                sl = TrajSlicerDataset(dset, n_frames, self.cfg.frameskip,
+                                       slice_seed=int(self.cfg.training.seed))   # B19
                 np.random.set_state(st)
                 bad = {k: (self.train_dims[k], getattr(sl, k))
                        for k in ("proprio_dim", "action_dim")
@@ -481,7 +470,7 @@ class Trainer:
             built.append(("demo", self._demo_train))
 
         # REALLOCATION. total_windows is a budget and frac_<group> a target ratio, but a group may
-        # not have that many windows -- early rounds have a small pool, wm_error keeps half of it.
+        # not have that many windows, since early rounds have a small pool.
         # Give each group min(cap, what it has) and hand the shortfall to whoever has spare,
         # weighted by the requested fractions, so the ratio is the closest achievable one and the
         # total is preserved whenever the data exists at all. Never errors.
@@ -536,8 +525,7 @@ class Trainer:
                                   else torch.utils.data.ConcatDataset(groups))
         total = len(self.datasets["train"])
         _order = ["demo"] + sorted(sel_of) + ["rollout"]
-        log.info(f"train set (planned_split={split}"
-                 + (f", err pct {err_pct}" if split == "wm_error" else "") + "): "
+        log.info("train set: "
                  + ", ".join(f"{g} {sizes.get(g, 0):,}" for g in _order)
                  + f" windows -> {total:,} total")
 
@@ -1194,22 +1182,13 @@ class Trainer:
                 with open(os.path.join(os.getcwd(), "wm_metrics.json"), "w") as _f:
                     json.dump(_m, _f, indent=2)
 
-                # BEST-CHECKPOINT SELECTION, the counterpart of train_policy's model_best.pt.
-                # Without it a fine-tune hands its LAST epoch forward, and on wall every round of
-                # every fine-tuning arm had val_loss_best_epoch == 1.
-                if _best_i == len(_vh) - 1:
-                    _bck = {}
-                    for _k in self._keys_to_save:
-                        _obj = self.__dict__[_k]
-                        _bck[_k] = (self.accelerator.unwrap_model(_obj)
-                                    if hasattr(_obj, "module") else _obj)
-                    os.makedirs("checkpoints", exist_ok=True)
-                    torch.save(_bck, "checkpoints/model_best.pth")
-                    with open(os.path.join(os.getcwd(), "model_best.json"), "w") as _bf:
-                        json.dump({"val_loss": _vh[-1], "epoch": len(_vh),
-                                   "metric": "val_loss"}, _bf, indent=2)
-                    log.info(f"[select] new best val_loss={_vh[-1]:.6f} at fine-tune epoch "
-                             f"{len(_vh)} -> checkpoints/model_best.pth")
+                # World-model best-checkpoint selection was REMOVED 2026-11-23 (M1). It wrote
+                # checkpoints/model_best.pth whenever the newest epoch had the lowest val_loss,
+                # and dagger_loop carried that forward. The validation set is dominated by
+                # demonstration windows, so the selector rejected any fine-tune that traded a
+                # little demonstration loss for the states the planner visits -- which is every
+                # useful fine-tune. val_loss_best_epoch is still reported above for diagnosis;
+                # nothing acts on it.
         self.epoch_log = OrderedDict()
 
     def plot_samples(

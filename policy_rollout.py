@@ -135,6 +135,14 @@ def rollout_policy(cfg, encoder, policy, device, env, n_episodes, horizon, base_
             ep_env_infos = env_shift.apply_override(_base, env_override, n_envs)
             if ep_env_infos:
                 env.update_env(ep_env_infos)
+            # B2, fixed 2026-11-24. In rs_mode with no per-trajectory layout (any env that is not
+            # wall) and no shift override, _base is [] and apply_override returns [], so the
+            # per-episode record below -- ep_env_infos[i] -- raised IndexError. The guard above is
+            # deliberately left intact: padding BEFORE it would make update_env run with a list of
+            # Nones, which it was previously skipped for. Padding after keeps update_env's
+            # behaviour identical and only makes the indexing safe.
+            if not ep_env_infos:
+                ep_env_infos = [None] * n_envs
             init_states, goal_states = env.sample_random_init_goal_states(seeds)
             init_states, goal_states = np.asarray(init_states), np.asarray(goal_states)
             # render + embed the goal, prepare leaves the env AT the goal, so re-prepare to init

@@ -347,24 +347,55 @@ class VqbetTrajectorySlicerDataset(TrajectoryDataset):
             assert future_seq_len <= window, "future_seq_len must be <= window"
         self.slices = []
 
+        # B1, fixed 2026-11-24. _sample_future_goal hands a window an ALL-ZEROS goal whenever
+        # [end + min_future_sep, T - future_seq_len) is empty, i.e. whenever
+        # end + min_future_sep >= T - future_seq_len. That is exactly
+        # min_future_sep + future_seq_len windows at the tail of every trajectory -- SEVEN with the
+        # live settings (min_future_sep 5, future_seq_len 1), independent of trajectory length. On
+        # ~26-frame planned trajectories that is 27% of all windows, and since
+        # policy_max_original_windows is 0 the policy trains on planned data only, so roughly one
+        # gradient step in four was being told "this constant blank vector is your goal" while the
+        # action targets remained the planner's real goal-directed actions. bet.py:235
+        # concatenates the goal onto the observation at every timestep, so the goal is half the
+        # input features, not a hint. Those windows teach the policy to ignore its goal.
+        #
+        # The fix DROPS those windows rather than keeping them with a zeros goal. The rejected
+        # alternative was only_sample_tail=true, which would have changed the goal distribution for
+        # every window instead of only the broken ones.
+        def _goal_ok(end, T):
+            """Would _sample_future_goal find a real goal frame for a window ending at `end`?"""
+            if not self.future_conditional:
+                return True
+            return (end + self.min_future_sep) < (T - self.future_seq_len)
+
+        n_dropped = 0
         min_window_required = window + action_window - 1
         for i in range(len(self.dataset)):
             T = self.dataset.get_seq_length(i)
-            self.slices += [(i, 0, end + 1) for end in range(window - 1)]
+            _cand = [(i, 0, end + 1) for end in range(window - 1)]
             if self.pad_seq_length:
                 if T - self.window >= 0:
-                    self.slices += [
-                        (i, start, start + self.window)
-                        for start in range(T - self.window + 1)
-                    ]
+                    _cand += [(i, start, start + self.window)
+                              for start in range(T - self.window + 1)]
             else:
                 if T - min_window_required < 0:
                     print(f"Ignored short sequence #{i}: len={T}, window={min_window_required}")
                 else:
-                    self.slices += [
-                        (i, start, start + self.window)
-                        for start in range(T - min_window_required + 1)
-                    ]
+                    _cand += [(i, start, start + self.window)
+                              for start in range(T - min_window_required + 1)]
+            _keep = [sl for sl in _cand if _goal_ok(sl[2], T)]
+            n_dropped += len(_cand) - len(_keep)
+            self.slices += _keep
+        if self.future_conditional and n_dropped:
+            print(f"[slicer] B1: dropped {n_dropped} window(s) whose future-goal range was empty, "
+                  f"{len(self.slices)} remain "
+                  f"({100.0 * n_dropped / max(1, n_dropped + len(self.slices)):.1f}% dropped)")
+        if self.future_conditional and not self.slices:
+            raise ValueError(
+                "every window was dropped because no trajectory is long enough for a future goal: "
+                f"need T > end + min_future_sep + future_seq_len with min_future_sep="
+                f"{self.min_future_sep}, future_seq_len={self.future_seq_len}, window={window}. "
+                "Generate longer trajectories or lower min_future_sep.")
 
     def get_seq_length(self, idx):
         return self.window

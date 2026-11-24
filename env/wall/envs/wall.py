@@ -56,6 +56,19 @@ class DotWall(gym.Env):
         self.sample_border_padding = wall_config.border_wall_loc - 1 + max(_sp, 0.0)
         self.rng = rng or np.random.default_rng()
         if wall_config is not None:
+            # B16, fixed 2026-11-24. fix_wall_location / fix_door_location used to be assigned
+            # ONLY in the else branch below, i.e. only when wall_config was None -- but
+            # `self.img_size = wall_config.img_size` above dereferences wall_config
+            # unconditionally, so a None config raises before that branch can ever run. The two
+            # arguments were therefore dead: the signature advertised a capability that could not
+            # take effect. No caller passes them today, so applying them is inert for existing
+            # code, but it makes the signature honest. The layout SHIFT feature was never affected,
+            # because env/wall/wall_env_wrapper.py:82 update_env writes the two values into
+            # wall_config and regenerates the layouts, bypassing the constructor entirely.
+            if fix_wall_location is not None:
+                wall_config.fix_wall_location = fix_wall_location
+            if fix_door_location is not None:
+                wall_config.fix_door_location = fix_door_location
             layouts, other_layouts = generate_wall_layouts(wall_config)
             self.layouts = layouts
         else:

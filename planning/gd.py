@@ -111,14 +111,8 @@ class GDPlanner(BasePlanner):
             self.wandb_run.log(
                 {f"{self.logging_prefix}/loss": total_loss.item(), "step": self.log_step_offset + i + 1}
             )
-            if self.evaluator is not None and self.eval_every is not None and i % self.eval_every == 0:
-                logs, successes, _, _ = self.evaluator.eval_actions(
-                    actions.detach(), filename=f"{self.logging_prefix}_output_{i+1}"
-                )
-                logs = {f"{self.logging_prefix}/{k}": v for k, v in logs.items()}
-                logs.update({"step": self.log_step_offset + i + 1})
-                self.wandb_run.log(logs)
-                self.dump_logs(logs)
-                if np.all(successes):
-                    break   # terminate planning if all success
+            # REMOVED 2026-11-23 (M3), same defect as planning/cem.py: the search rolled the
+            # current plan out in the real ENVIRONMENT and stopped once the environment said every
+            # trajectory had succeeded. This planner is not used by any current arm, but the leak
+            # was identical and removing it here keeps the two planners honest in the same way.
         return actions, np.full(n_evals, np.inf)   # all actions are valid

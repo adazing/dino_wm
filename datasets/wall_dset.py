@@ -96,9 +96,29 @@ class WallDataset(TrajDataset):
             result.append(self.actions[i, :T, :])
         return torch.cat(result, dim=0)
 
+    def _episode_images(self, idx):
+        """The whole episode's image tensor, with a one-entry cache.
+
+        B15, fixed 2026-11-24. get_frames used to torch.load the ENTIRE episode on every call and
+        then slice it down to the requested frames, so asking for a single frame deserialised the
+        whole episode from the NAS. It is called twice per evaluation episode (start frame, goal
+        frame), again per filmed episode, and once per window while the pool is embedded, so a
+        round performed thousands of full-episode loads to obtain individual frames.
+
+        A ONE-entry cache is enough because the access pattern is repeated calls for the same
+        episode -- start then goal, or window after window. It is safe because the episode files
+        are read-only for the duration of a run, so there is no staleness to manage, and each
+        DataLoader worker holds its own copy of this object, so there is no sharing to coordinate.
+        Memory is one episode of 65x65x3 uint8 frames.
+        """
+        if getattr(self, "_img_cache_idx", None) == idx:
+            return self._img_cache
+        img = torch.load(self.data_path / "obses" / f"episode_{idx:03d}.pth")
+        self._img_cache_idx, self._img_cache = idx, img
+        return img
+
     def get_frames(self, idx, frames):
-        obs_dir = self.data_path / "obses"
-        image = torch.load(obs_dir / f"episode_{idx:03d}.pth")
+        image = self._episode_images(idx)
         act = self.actions[idx, frames]
         state = self.states[idx, frames]
         proprio = self.proprios[idx, frames]

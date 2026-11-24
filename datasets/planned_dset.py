@@ -37,7 +37,7 @@ class PlannedTrajDataset(TrajDataset):
     def __init__(self, data_path: str, transform: Optional[Callable] = None,
                  only_successes: bool = False, max_trajectories: Optional[int] = None,
                  selection: str = "first", selection_seed: int = 0,
-                 select: str = "all", wm_err_pct: float = 50.0,
+                 select: str = "all",
                  proprio_mean=None, proprio_std=None):
         """only_successes: keep only trajectories that reached the goal (needs the
         'successes' metadata). max_trajectories: cap how many to keep, applied after the
@@ -48,15 +48,19 @@ class PlannedTrajDataset(TrajDataset):
         'random' -> N drawn uniformly without replacement from the whole pool, seeded by
         'random_with_replacement' -> N drawn WITH replacement, so a trajectory can appear
 
-        select picks which trajectories are worth training a world model on. wm_fail means the
-        endpoint the world model predicted was further from the real endpoint than wm_err_pct
-        percent of this file's trajectories, so the threshold moves as the model improves.
-          all                 every trajectory
-          policy_fail         the plan did not reach its goal
-          wm_fail             the world model mispredicted the endpoint
-          wm_ok               the complement of wm_fail: error BELOW the percentile
-          wm_and_policy_fail  both
-          wm_fail_policy_ok   mispredicted but the plan still reached the goal
+        select picks which trajectories to keep.
+          all          every trajectory
+          policy_fail  the plan did not reach its goal
+
+        The four world-model-error modes (wm_fail, wm_ok, wm_and_policy_fail, wm_fail_policy_ok)
+        were REMOVED 2026-11-24, with the percentile threshold they depended on. They thresholded
+        wm_latent_err at a percentile of this file's own trajectories, so the bar moved every
+        round. Measured on the two complete wall arms, that split is a near-restatement of
+        planner success/failure: AUC 0.905 and 0.855 for wm_latent_err predicting planner
+        failure, Cohen's kappa 0.665 and 0.553. The reason is close to tautological --
+        wm_latent_err is the gap between the predicted and the realised endpoint, so a plan that
+        failed necessarily ended somewhere the model did not predict. policy_fail measures the
+        same thing with a stable definition. See CODE_AUDIT-adaBot.md M5.
         """
         self.data_path = Path(data_path)
         self.transform = transform
@@ -78,14 +82,10 @@ class PlannedTrajDataset(TrajDataset):
         goal_states = payload.get("goal_states")   # planning goal state
         successes = payload.get("successes")   # reached-goal tag
 
-        wm_pred = payload.get("wm_pred_final_states")   # needs probe_ckpt at generation time
-
         # select trajectories, success filter first, then cap the count
         keep = list(range(len(seq_lengths)))
         self.n_pool = len(seq_lengths)   # trajectories in the pool before any filtering
-        keep = self._apply_select(keep, str(select), float(wm_err_pct),
-                                  successes, wm_pred, states, seq_lengths,
-                                  payload.get("wm_latent_err"))
+        keep = self._apply_select(keep, str(select), successes)
         self.n_selected = len(keep)   # what select left, before only_successes/max_trajectories
         if only_successes:
             if successes is None:
@@ -157,66 +157,30 @@ class PlannedTrajDataset(TrajDataset):
         self.proprio_dim = self.proprios[0].shape[-1]
 
     @staticmethod
-    def _apply_select(keep, select, wm_err_pct, successes, wm_pred, states, seq_lengths,
-                      wm_latent_err=None):
+    def _apply_select(keep, select, successes):
         """Keep the trajectories `select` asks for. Returns keep unchanged for 'all'."""
         if select == "all":
             return keep
-        modes = ("all", "policy_fail", "wm_fail", "wm_ok", "wm_and_policy_fail",
-                 "wm_fail_policy_ok")
-        if select not in modes:
-            raise ValueError(f"select must be one of {modes}, got {select!r}")
+        REMOVED = ("wm_fail", "wm_ok", "wm_and_policy_fail", "wm_fail_policy_ok")
+        if select in REMOVED:
+            raise ValueError(
+                f"select={select!r} was removed 2026-11-24. The world-model-error split "
+                f"thresholded wm_latent_err at a percentile of each file's own trajectories, so "
+                f"it meant something different every round, and it was measured to be a "
+                f"near-restatement of planner success/failure (AUC 0.905/0.855, kappa "
+                f"0.665/0.553 on the two complete wall arms). Use select=policy_fail, which is "
+                f"the same signal with a stable definition. See CODE_AUDIT-adaBot.md M5.")
+        if select != "policy_fail":
+            raise ValueError(f"select must be 'all' or 'policy_fail', got {select!r}")
         if successes is None:
             raise ValueError(f"select={select!r} needs 'successes' metadata in the planned file.")
-        needs_wm = select in ("wm_fail", "wm_ok", "wm_and_policy_fail", "wm_fail_policy_ok")
-        if needs_wm and not wm_latent_err and not wm_pred:
-            raise ValueError(
-                f"select={select!r} needs a world-model endpoint error. Generation writes "
-                f"'wm_latent_err' on any run and 'wm_pred_final_states' when probe_ckpt is set, "
-                f"and this file has neither. Regenerate, or use select=policy_fail.")
 
-        err = {}
-        if needs_wm:
-            if wm_latent_err:
-                # latent units, only the ordering matters since the threshold is a percentile
-                for i in keep:
-                    err[i] = float(wm_latent_err[i])
-                units = "latent"
-            else:
-                # probe path, the error is in world units
-                for i in keep:
-                    real = torch.as_tensor(states[i][int(seq_lengths[i]) - 1]).float().flatten()
-                    pred = torch.as_tensor(wm_pred[i]).float().flatten()
-                    n = min(len(real), len(pred))
-                    err[i] = float(torch.linalg.norm(pred[:n] - real[:n]))
-                units = "state"
-            thr = float(np.percentile(list(err.values()), wm_err_pct)) if err else 0.0
-
-        out = []
-        for i in keep:
-            ok = bool(successes[i])
-            wm_bad = needs_wm and err[i] >= thr
-            if select == "policy_fail" and not ok:
-                out.append(i)
-            elif select == "wm_ok" and not wm_bad:
-                out.append(i)
-            elif select == "wm_fail" and wm_bad:
-                out.append(i)
-            elif select == "wm_and_policy_fail" and wm_bad and not ok:
-                out.append(i)
-            elif select == "wm_fail_policy_ok" and wm_bad and ok:
-                out.append(i)
+        out = [i for i in keep if not bool(successes[i])]
         if not out:
-            n_fail = sum(1 for i in keep if not bool(successes[i]))
-            n_wm = sum(1 for i in keep if needs_wm and err[i] >= thr)
             raise NoMatchingTrajectories(
-                f"select={select!r} matched no trajectories out of {len(keep)}. "
-                f"{n_fail} failed, {n_wm} were mispredicted"
-                + (f" (threshold {thr:.3f} {units})" if needs_wm else "")
-                + ". The two sets do not overlap, so lower wm_finetune_err_pct to widen the "
-                  "mispredicted set, or use select=wm_fail, which a percentile always fills.")
-        print(f"[planned] select={select} kept {len(out)}/{len(keep)} trajectories"
-              + (f", wm endpoint error threshold {thr:.3f} ({units})" if needs_wm else ""))
+                f"select={select!r} matched no trajectories out of {len(keep)}: every one "
+                f"reached its goal. Use select=all.")
+        print(f"[planned] select={select} kept {len(out)}/{len(keep)} trajectories")
         return out
 
 

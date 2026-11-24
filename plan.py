@@ -447,6 +447,14 @@ def load_model(model_ckpt, train_cfg, num_action_repeat, device):
         num_proprio_repeat=train_cfg.num_proprio_repeat,
     )
     model.to(device)
+    # B11, fixed 2026-11-24, and it is not cosmetic. conf/predictor/vit.yaml sets dropout: 0.1,
+    # and nothing in the planning or generation path called .eval(), so the world model has been
+    # PLANNING WITH DROPOUT ACTIVE in every run in the results ledger. CEM scores 300 candidate
+    # action sequences per optimisation step, each through a different random dropout mask, then
+    # keeps the elite set -- so part of what the search selected for was a lucky dropout draw, and
+    # planning was nondeterministic even under a fixed seed. This compounds M10: an unbounded
+    # search over a noisy objective.
+    model.eval()
     return model
 
 

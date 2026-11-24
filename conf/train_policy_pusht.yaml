@@ -177,3 +177,64 @@ hydra:
 # Requires eval_goal_render='env' (the default) -- with 'dataset' the goal picture would show
 # the unshifted world and train_policy refuses to run.
 eval_env_override: {}
+
+# --- offline checkpoint selection (no simulator) ------------------------------------------------
+# select_metric above may name ANY key the offline eval produces, in which case the checkpoint is
+# chosen without a single environment rollout. The keys are
+# "offline/<split>/<metric>", where <split> is all | success | fail and <metric> is one of:
+#
+#   exec_mse            MSE on the action the rollout ACTUALLY executes (element 0 of the last
+#                       predicted chunk). The most rollout-relevant single number here, because
+#                       the other eight slots in a window are predicted and then discarded.
+#   exec_mse_p90        the 90th percentile of the same per-window error. A mean hides the rare
+#                       large errors that are the ones that actually end an episode.
+#   exec_mse_frac_bad   the fraction of windows whose error exceeds select_err_threshold.
+#   chunk_mse           MSE over the whole executed chunk, plus _p90 / _frac_bad.
+#   offset_loss         the model's own L1 term over the full chunk.
+#   classification_loss the VQ codebook cross-entropy term.
+#   total_loss          the model's own total loss.
+#   code_err            1 - (both codebook heads agreeing), so lower is better like the rest.
+#   n_windows           how many windows the split contributed, for sanity-checking.
+#
+# EVERY key is "lower is better", so pair any of them with select_mode: min.
+#
+# select_holdout_path MUST be a fixed directory of planned shards that is never trained on and
+# never added to. Pointing it at the live pool defeats the purpose: the pool gains shards every
+# round, so the metric's data changes underneath it and rounds stop being comparable.
+select_holdout_path: null
+# which splits to build. "success" keeps only trajectories where the planner reached its goal,
+# "fail" only those where it did not; selecting on one or the other is a deliberate choice about
+# which errors should count.
+select_holdout_splits: [all, success, fail]
+# cap the holdout size for speed (null = all of it). Applied in file order, never reseeded.
+select_holdout_max_trajectories: null
+# how often to run the offline eval, in epochs. null = eval_freq.
+select_offline_freq: null
+# the *_frac_bad threshold, in the same units as exec_mse. null = do not report frac_bad.
+select_err_threshold: null
+# cap batches per split for speed (null = the whole split).
+select_max_batches: null
+select_sample_seed: 12345
+
+# --- weight averaging, instead of selecting an epoch (M2) -------------------------------------
+# Measured 2026-11-23 over 39 rounds of four wall arms: the held-out action loss correlates with
+# goal25_valid/max_success_rate at Spearman only -0.31, so no offline metric here is a trustworthy
+# selector. Averaging has no selector, so there is nothing to leak and no proxy to validate.
+#   null      -> off, behave as before
+#   uniform   -> equal weight to every snapshot (SWA; Izmailov et al. 2018)
+#   ema       -> exponentially weighted, recent snapshots count more. This is the form standard in
+#                imitation learning: the diffusion-policy family (BESO, DiWA) uses EMA weights at
+#                inference, and this repo already calls ema_step() on its diffusion path.
+# Snapshots are taken from the LIVE weights after each epoch, so save_every does not limit how
+# many the average gets. Set policy_ckpt_select: avg in the dagger config to carry it forward.
+policy_weight_avg: null
+weight_avg_every: 1          # snapshot every N epochs
+weight_avg_start_epoch: 0    # skip the first N epochs; 0 includes the warm-started starting point,
+                             # which matters because 19 of 39 measured rounds peaked at epoch 0
+weight_avg_ema_power: 0.6667 # ema only; the diffusion path's default is 2/3
+
+# E5: stop an evaluation episode once every environment in the batch has reached its goal. The
+# reported metric is max_success_rate, "reached at any step", so steps after that cannot change it.
+# It DOES change final_success_rate and final_goal_dist, neither of which this project uses. Set
+# false to run the full eval_horizon regardless.
+eval_break_on_success: true

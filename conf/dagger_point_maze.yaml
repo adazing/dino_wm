@@ -109,8 +109,6 @@ wm_train_config_name: train_point_maze
 #   wm_fail             the world model mispredicted the endpoint
 #   wm_and_policy_fail  both
 #   wm_fail_policy_ok   mispredicted but the plan still reached the goal
-wm_finetune_select: wm_and_policy_fail
-wm_finetune_err_pct: 50
 wm_finetune_epochs: 5
 # null keeps the learning rates in the world-model training config.
 wm_finetune_lr: null

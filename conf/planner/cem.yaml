@@ -4,12 +4,40 @@ topk: 30
 num_samples: 300
 var_scale: 1
 
-# Bound on |action| during the search, in the dataset's normalised space where
-# demonstrations are std 1 centred on 0. null = unbounded, the original behaviour.
-action_clamp: null
+# Bound on |action| during the search, in the dataset's normalised space where demonstrations are
+# std 1 centred on 0. null = unbounded, the original behaviour.
+#
+# SET 2026-11-24 (M10). Was null, i.e. unbounded, in every run in the results ledger. CEM's
+# proposal is torch.randn(...) * sigma + mu with sigma re-estimated from the elite set each step,
+# so with no clamp the search walks outward with nothing pulling it back. Because CEM optimises the
+# world model's PREDICTION rather than reality, any out-of-range action that makes the model
+# hallucinate progress toward the goal is exactly what the search rewards -- model exploitation.
+# Measured consequences, recorded in planning/cem.py:132-136: the pool's actions reach std ~1.5,
+# mean -0.56, with 29% of steps beyond |2| against roughly 1.4% of demonstration steps, and a
+# 5-epoch fine-tune on 500 pool windows raised validation loss 28% at training loss 10.2 against
+# 0.011 on demonstration windows.
+#
+# 2.4 is the demonstration ceiling, not an arbitrary bound: wall's action statistics over all
+# 96,000 demonstration steps give std 0.752 and a hard maximum of 1.799, and 1.799 / 0.752 = 2.39.
+# So it forbids nothing the training data contains while confining the search to the region the
+# world model was fit on. It also costs no reach: 25 actions at 1.8 raw travel about 90 units
+# axis-aligned, and the longest required path anywhere in the pool is 83. The 99.5th-percentile
+# alternative, 2.2, gives 82.7 units against that 83-unit task, so it is the second arm rather than
+# the first. See CODE_AUDIT-adaBot.md M10.
+action_clamp: 2.4
 
+# How many CEM refinement iterations per task. OPEN QUESTION: the per-step objective is logged as
+# "<prefix>/loss", so where it plateaus is readable from any existing run's wandb history without
+# re-running anything. If the objective is flat after, say, 12 steps, the remaining 18 are paid for
+# nothing -- and generation is 63% of round wall-clock, so this is the largest single lever on run
+# time. Measure before changing it: a shorter search is a different planner, so it needs an A/B.
 opt_steps: 30
-eval_every: 1
+# IGNORED since 2026-11-23 (M3). It used to say how often the search rolled the current plan out in
+# the real environment to check for success and freeze finished trajectories. That gave the planner
+# up to opt_steps real rollouts per task and let ground truth shape the saved plan, so the rollout
+# was removed from planning/cem.py and planning/gd.py. Kept as a key only because plan.py passes it
+# to the planner constructor by keyword.
+eval_every: null
 
 # opt-in early-stop (both null = off -> run all opt_steps, unchanged default), stop_loss_thresh,
 # break when EVERY trajectory's best imagined objective <= this value (the WM thinks all plans

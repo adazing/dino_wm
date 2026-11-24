@@ -471,7 +471,7 @@ class PushTEnv(gym.Env):
                         rs.randint(50, 450),
                         rs.randint(100, 400),
                         rs.randint(100, 400),
-                        rs.randn() * 2 * np.pi - np.pi,
+                        rs.rand() * 2 * np.pi - np.pi,   # B17: was randn, which is unbounded
                         0,  # set random velocity to 0
                         0,  # set random velocity to 0
                     ]
@@ -483,7 +483,7 @@ class PushTEnv(gym.Env):
                         rs.randint(50, 450),
                         rs.randint(100, 400),
                         rs.randint(100, 400),
-                        rs.randn() * 2 * np.pi - np.pi,
+                        rs.rand() * 2 * np.pi - np.pi,   # B17: was randn, which is unbounded
                     ]
                 )
         self._set_state(state)

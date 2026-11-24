@@ -151,6 +151,9 @@ shard_every: 5
 #   valid         demo trajectory from the valid split, goal rollout_goal_offset frames later
 #   train         same from the train split
 rollout_goal_source: random_state
+# B5, annotated 2026-11-24: DEAD for wall as configured. policy_rollout.py:111 assigns goal_off
+# only inside `if not rs_mode`, and wall sets rollout_goal_source: random_state, so this value is
+# never read. It becomes live only if rollout_goal_source is changed to valid or train.
 rollout_goal_offset: 25
 
 # Run every env in this process instead of forked subprocesses. Slower but avoids EGL failures under fork.
@@ -223,7 +226,6 @@ wm_train_config_name: train_wall
 #             model redefines its own failures. Harmless while both caps are null (nothing is
 #             excluded); only bites when you use the split to drop a group.
 #             -> wm_max_wm_ok_windows / wm_max_wm_fail_windows
-wm_planned_split: planner
 
 # --- mode-independent groups -----------------------------------------------------------------
 # Demonstrations. 0 here is the old wm_finetune_data_source: planned.
@@ -236,13 +238,9 @@ wm_max_demo_windows: null
 # that could be right or wrong, and no planner outcome either.
 wm_max_rollout_windows: null
 
-# --- planned groups, wm_planned_split: planner -----------------------------------------------
+# --- planned groups --------------------------------------------------------------------------
 wm_max_success_windows: null
 wm_max_failure_windows: null
-
-# --- planned groups, wm_planned_split: wm_error ----------------------------------------------
-wm_max_wm_ok_windows: null
-wm_max_wm_fail_windows: null
 
 # --- proportional mode for the world-model fine-tune --------------------------------------
 # The caps above fix each group's SIZE; the MIX is whatever the pool happens to hold. Measured
@@ -258,13 +256,7 @@ wm_frac_demo: null
 wm_frac_rollout: null
 wm_frac_success: null
 wm_frac_failure: null
-wm_frac_wm_ok: null
-wm_frac_wm_fail: null
 
-
-# The percentile that divides wm_ok from wm_fail. Recomputed from the current pool every round,
-# so "50" always means the worse half of THIS round's data. Only read in wm_error mode.
-wm_finetune_err_pct: 50
 wm_finetune_epochs: 5
 # Which checkpoint each round's fine-tune STARTS from.
 #   chain  the previous round's fine-tuned world model. Drift compounds across rounds: measured on
@@ -275,10 +267,20 @@ wm_finetune_epochs: 5
 #          previous round's.
 wm_finetune_from: chain
 
-# Carry the fine-tune's BEST epoch forward rather than its last, selected on the world model's
-# validation loss. On wall every round of every fine-tuning arm reported val_loss_best_epoch ==
-# 1, so the loop was adopting the worst of five epochs. false restores the old behaviour.
-wm_use_best_checkpoint: true
+# wm_use_best_checkpoint was REMOVED 2026-11-23 (M1). The fine-tune's last epoch is always
+# carried forward now. The flag selected the epoch with the lowest world-model validation loss,
+# but that validation set is dominated by demonstration windows, so it rejected every fine-tune
+# that helped the states the planner actually visits at a small cost on demonstrations. On wall
+# every round of every fine-tuning arm reported val_loss_best_epoch == 1, which the selector read
+# as "the fine-tune only hurt" and the loop then turned into a no-op.
+#
+# WORTH REVISITING, NOT YET WORTH BUILDING: a planned-valid split would give a selection signal
+# that is actually about the right distribution -- hold out planner-generated wall trajectories
+# and select the epoch with the lowest prediction error on those. The pieces exist, since the
+# pool already stores failures alongside successes. Two reasons it is parked: the held-out set
+# would be resampled from a growing pool each round, so the number is not comparable round to
+# round, and the literature on checkpoint selection (see CODE_AUDIT Part 14) finds offline loss
+# a weak predictor of downstream success even when the distribution is right.
 # null keeps the learning rates in the world-model training config.
 wm_finetune_lr: 1e-5
 # Restrict the world-model fine-tune to the predictor's LAST transformer block plus its final norm
@@ -303,19 +305,28 @@ wm_finetune_last_layer_only: true
 # Forced on by wm_finetune_last_layer_only. false restores the old trainable behaviour.
 wm_finetune_freeze_encoders: true
 
-
 # After each round, score the freshly trained policy on the SAME (init, goal) pairs the planner was
 # handed. The planner's rate is measured on the policy's own failures, which get harder every round,
 # so it cannot be read against the policy's goal25 passes at fixed difficulty. This puts both on
 # identical problems. Costs a few GPU-minutes per round. Logged to the loop run as relabel/*.
 # Hand the next round model_best.pt (best select_metric during the round) rather than
 # model_final.pt (the last epoch). false restores the old last-epoch behaviour.
-use_best_checkpoint: true
 eval_policy_on_relabel: true
 # Each round, also plan this many env-sampled tasks of FIXED difficulty with that round's world model,
 # NOT added to the pool. gen_measure/success_rate then moves only when the world model moves, which
 # separates "the world model got worse" from "the exam got harder". 20 tasks is about 30 min a round.
-measure_random_trajectories: 10   # fixed-difficulty WM yardstick, ~15 min a round
+# A measurement-only arm: plans this many extra trajectories per round on a FIXED task set, never
+# absorbed into the training pool. It exists because the relabel arm's difficulty rises every round
+# as the policy improves, so planner success there cannot be compared across rounds; this can.
+# Raised from 10 to 30 on 2026-11-24 (E8): at n=10 the standard error on a rate near 0.5 is about
+# 0.16, which is why M7 could not resolve 0.856 against 0.811.
+measure_random_trajectories: 30
+# null = use this environment's own generation goal_source, which is what you want: random_state
+# for wall, dset (the valid demo split) for pusht. Set a value only to override that.
+measure_goal_source: null
+# true = the same tasks every round, so round-to-round comparison is paired. Was effectively false
+# before 2026-11-24, which is where most of the noise came from.
+measure_fixed_tasks: true
 # Env-step budgets for that eval; the first is what the gap is computed from.
 #   25   the planner's own budget, goal_H * frameskip. The fair head-to-head.
 #   300  the goal25 budget. Separates "the policy is slower" from "the policy cannot".
@@ -397,9 +408,28 @@ train_overrides:
   - n_eval_videos=10
   - eval_video_fps=12
   - wandb_logging=true
-  # Wall eval passes, held-out demos, the trained-on split, and the env-sampled across-the-wall
-  # reach.
-  - 'eval_passes=[{name:goal25_valid,type:goal,goal_offset:25,horizon:300,goal_source:valid},{name:goal25_train,type:goal,goal_offset:25,horizon:300,goal_source:train},{name:reach_rs,type:goal,horizon:300,goal_source:random_state}]'
+  # Wall eval passes. CHANGED 2026-11-24 (M11): reach_rs ONLY.
+  #
+  # Wall generates its training data from env-sampled start/goal pairs that are guaranteed to
+  # straddle the wall (env/wall/envs/wall.py:169-188 draws start_x left of the wall and target_x
+  # right of it, swapped 50% of the time). reach_rs is the same task family, so it is the only
+  # pass that tests what the pipeline is trained to do.
+  #
+  # goal25_valid and goal25_train are DISABLED for wall. Their goal is the state the same
+  # demonstration occupied 25 frames later (train_policy.py:1297), and wall's demonstrations are
+  # wall_single -- RANDOM-ACTION data -- so they ask the policy to reproduce random drift and
+  # require a wall crossing only by chance.
+  #
+  # WARNING, read before comparing numbers: every wall result in DAGGER_RESULTS_LOG-adaBot.md,
+  # F1 through F17, is goal25_valid/max_success_rate. Runs made after this change report
+  # reach_rs/max_success_rate instead and are NOT comparable with any of them. Expect a lower
+  # number: reach_rs tasks span the box, and M7 measured planner success falling from 0.991 below
+  # 20 units to 0.000 above 70.
+  #
+  # Support is intact. To restore either, add it back to this list:
+  #   {name:goal25_valid,type:goal,goal_offset:25,horizon:300,goal_source:valid}
+  #   {name:goal25_train,type:goal,goal_offset:25,horizon:300,goal_source:train}
+  - 'eval_passes=[{name:reach_rs,type:goal,horizon:300,goal_source:random_state}]'
 
 # --- policy-side settings, must match the checkpoint being scouted -------------------------
 # The rollout stacks window_size observations and ensembles over action_window_size, exactly as
@@ -414,7 +444,6 @@ num_pred: 1
 frameskip: 1
 normalize_action: true
 goal_conditional: true
-
 
 # --- test-time environment shift (see env/env_shift.py) -------------------------------
 # Both blocks are forwarded by dagger_loop._shift_overrides to the GENERATION step and the
@@ -440,3 +469,12 @@ env_kwargs: {}
 #     bg_color: [200, 200, 200] # the field, default white
 #     obs_corruption: blur      # blur | snp1 | snp5 | dark
 #     obs_corruption_level: 2.0 # optional, defaults per corruption
+
+# Which checkpoint each round hands to the next: avg | best | final. Outranks use_best_checkpoint.
+#   avg   -> checkpoints/model_avg.pt, requires policy_weight_avg in the train_policy config.
+#            No selector, so no selection leak and no proxy to validate. The recommended route.
+#   best  -> model_best.pt, chosen by select_metric. With a rollout metric this is M2's leak.
+#   final -> model_final.pt, the last epoch.
+#   final -> model_final.pt, the last epoch. THE DEFAULT since 2026-11-24 (E2), because it
+#            involves no selection and so carries no selection leak.
+policy_ckpt_select: final

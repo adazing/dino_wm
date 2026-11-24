@@ -628,7 +628,17 @@ def main(cfg):
 
     # deterministic mode, fix the shuffle order (generator) and per-worker RNG (worker_init_fn) so
     # the data pipeline is reproducible too.
-    seed_worker = _seed_worker if deterministic else None
+    # B20, fixed 2026-11-24: installed UNCONDITIONALLY. _seed_worker reseeds numpy and random in
+    # each DataLoader worker from that worker's own torch seed. It used to be installed only when
+    # deterministic=true, which no config sets, so worker_init_fn was None. PyTorch seeds each
+    # worker's TORCH rng but does nothing for numpy, and under the default fork start method all
+    # num_workers (8) inherit one identical numpy state from the parent -- so the goal draw in
+    # _sample_future_goal, which uses np.random.randint, returned the SAME sequence in every
+    # worker in lockstep. Eight workers were producing one effective stream of goal offsets.
+    # Installing the seeder unconditionally fixes that without turning on full determinism, which
+    # would also pin cuDNN and cost throughput. Each worker's torch seed differs per worker AND
+    # per epoch, so randomness across epochs is preserved while being reproducible.
+    seed_worker = _seed_worker
     # windows_per_epoch: pin one epoch to a fixed number of windows, so `epochs` is a unit of
     # WORK rather than "one pass over whatever happens to be loaded". Without it the same epochs
     # value means a few hundred optimizer steps on a small planned-only pool and over a hundred
@@ -661,6 +671,60 @@ def main(cfg):
         test_data, batch_size=gpu_batch_size, shuffle=False, num_workers=cfg.num_workers,
         worker_init_fn=seed_worker)
         if have_test else None)
+
+    # --- frozen offline-selection holdout ---------------------------------------------------
+    # select_holdout_path points at a FIXED directory of planned shards that is never trained on
+    # and never grown. The run's own validation split cannot serve this purpose: it is drawn from
+    # the pool, which gains shards every DAgger round, so its membership changes and its loss is
+    # not comparable round to round. A frozen directory is comparable by construction.
+    #
+    # Three splits are built, because an average over successes and failures together is the thing
+    # the checkpoint-selection literature says ranks models badly: "all", "success" (the planner
+    # reached its goal) and "fail" (it did not). select_metric can name any one of them.
+    select_loaders = {}
+    _sel_hold = cfg.get("select_holdout_path", None)
+    if _sel_hold:
+        from datasets.planned_dset import PlannedTrajDataset
+        from datasets.img_transforms import default_transform
+        _hold_want = [str(x) for x in (cfg.get("select_holdout_splits", None)
+                                       or ["all", "success", "fail"])]
+        _hold_n = cfg.get("select_holdout_max_trajectories", None)
+        for _split in _hold_want:
+            _kw = dict(only_successes=False, select="all")
+            if _split == "success":
+                _kw = dict(only_successes=True, select="all")
+            elif _split == "fail":
+                _kw = dict(only_successes=False, select="policy_fail")
+            elif _split != "all":
+                raise ValueError(f"select_holdout_splits entries must be all|success|fail, "
+                                 f"got {_split!r}")
+            try:
+                _hd = PlannedTrajDataset(
+                    _sel_hold, transform=default_transform(cfg.img_size),
+                    max_trajectories=(None if _hold_n is None else int(_hold_n)),
+                    selection="first",            # deterministic: never reseeded per round
+                    selection_seed=0, **_kw)
+            except Exception as _e:
+                print(f"[select] holdout split {_split!r} unavailable: {_e}")
+                continue
+            if len(_hd) == 0:
+                print(f"[select] holdout split {_split!r} is empty, skipped")
+                continue
+            _hr = make_raw_policy_traj([], [_hd], "planned")
+            if precompute:
+                _hr = TrajectoryEmbeddingDataset(encoder, _hr, device=cfg.embed_device)
+            _hw = VqbetTrajectorySlicerDataset(_hr, **slicer_kwargs)
+            if len(_hw) == 0:
+                print(f"[select] holdout split {_split!r} yielded 0 windows, skipped")
+                continue
+            select_loaders[_split] = torch.utils.data.DataLoader(
+                _hw, batch_size=gpu_batch_size, shuffle=False,
+                num_workers=cfg.num_workers, worker_init_fn=seed_worker)
+            print(f"[select] offline holdout {_split!r}: {len(_hd)} trajectories, "
+                  f"{len(_hw):,} windows")
+        if not select_loaders:
+            print(f"[select] select_holdout_path={_sel_hold} produced no usable split; "
+                  f"offline selection is OFF")
 
     if have_test:
         cbet_model, optimizer, train_loader, test_loader = accelerator.prepare(
@@ -722,7 +786,22 @@ def main(cfg):
             "wandb_run_id": (wandb.run.id if do_wandb and wandb.run is not None else None),
         }, ckpt_dir / name)
 
+    from offline_select import offline_metrics_multi
+    from weight_avg import WeightAverager
+
     metrics_history = []
+
+    # --- weight averaging, the alternative to selecting an epoch -------------------------------
+    # Averaging has no selector, so there is nothing to leak and no proxy to validate. See
+    # weight_avg.py for why diffusion_ema.EMAModel is NOT reused (it averages parameters only,
+    # and VQ-BeT keeps its codebook in buffers).
+    _wa_mode = cfg.get("policy_weight_avg", None)
+    _wa = None
+    if _wa_mode and str(_wa_mode).lower() not in ("none", "null", "false"):
+        _wa = WeightAverager(mode=str(_wa_mode),
+                             ema_power=float(cfg.get("weight_avg_ema_power", 2.0 / 3.0)))
+        print(f"[weight_avg] mode={_wa_mode} every={cfg.get('weight_avg_every', 1)} "
+              f"start_epoch={cfg.get('weight_avg_start_epoch', 0)}")
 
     # --- best-checkpoint tracking ----------------------------------------------------------------
     # model_final.pt is only the last epoch, which is routinely NOT the best model: on wall round 0
@@ -784,6 +863,29 @@ def main(cfg):
                     traceback.print_exc()
             accelerator.wait_for_everyone()
 
+        # offline selection, no environment and no rollout. Runs on its own frequency because
+        # it is cheap relative to a rollout eval, so it can be the thing that picks the checkpoint
+        # even when eval_on_env is rare or off entirely. _maybe_save_best keys on whether
+        # select_metric is present in the dict it is handed, so whichever eval owns the selected
+        # metric is the one that writes model_best.pt; the others just log.
+        _off_freq = int(cfg.get("select_offline_freq", None) or cfg.eval_freq)
+        if select_loaders and epoch % _off_freq == 0 and accelerator.is_main_process:
+            try:
+                _om = offline_metrics_multi(
+                    run_model, select_loaders, accelerator.unwrap_model(cbet_model), device,
+                    err_threshold=cfg.get("select_err_threshold", None),
+                    max_batches=cfg.get("select_max_batches", None),
+                    sample_seed=int(cfg.get("select_sample_seed", 12345)))
+                if _om:
+                    print(f"offline_select: {_om}")
+                    if do_wandb:
+                        wandb.log({**_om, "epoch": epoch})
+                    _maybe_save_best(_om, epoch)
+            except Exception as _e:
+                print(f"offline_select skipped: {_e}")
+                traceback.print_exc()
+            cbet_model.train()
+
         # validation loss + action_diff metrics, skipped when the held-out split is empty
         if test_loader is not None and epoch % cfg.eval_freq == 0:
             cbet_model.eval()
@@ -805,6 +907,19 @@ def main(cfg):
                 print(f"Test loss: {total_loss / max(1, n)}")
                 if do_wandb and not use_diffusion:
                     wandb.log({**{f"eval/epoch_wise_{k}": v for k, v in ad.items()}, "epoch": epoch})
+                # The epoch_wise_* series above are SUMS over batches (bug B6), so they grow with
+                # the pool and are not comparable across rounds. These are the same quantities as
+                # MEANS, and they are what select_metric should name if it names an action loss:
+                #   select_metric: val/action_diff      select_mode: min
+                # val/action_diff is the error on [:, -1, 0], the one action the rollout executes.
+                # Measured over 39 rounds this tracks goal25_valid/max_success_rate at Spearman
+                # only -0.31, so prefer policy_weight_avg over selecting on it.
+                if not use_diffusion:
+                    _vm = {f"val/{k}": (v / max(1, n)) for k, v in ad.items()}
+                    _vm["val/loss"] = total_loss / max(1, n)
+                    if do_wandb:
+                        wandb.log({**_vm, "epoch": epoch})
+                    _maybe_save_best(_vm, epoch)
 
         # save before this epoch's training, so model_{epoch}.pt is the exact model that produced
         # the epoch-{epoch} metrics logged above, env eval + val loss.
@@ -834,6 +949,14 @@ def main(cfg):
             raw_model.finish_epoch()
         if accelerator.is_main_process:
             print(f"Train loss: {train_loss / max(1, len(train_loader))}")
+
+        # snapshot for the weight average. AFTER finish_epoch so the codebook is settled, and on
+        # the live weights rather than a saved file, so save_every does not limit how many
+        # snapshots the average gets.
+        if _wa is not None and accelerator.is_main_process:
+            if (epoch >= int(cfg.get("weight_avg_start_epoch", 0))
+                    and epoch % max(1, int(cfg.get("weight_avg_every", 1))) == 0):
+                _wa.update(raw_model)
 
     # final closed-loop eval + best-metric report (mirrors online_eval.py's tail)
     if cfg.eval_on_env:
@@ -882,6 +1005,49 @@ def main(cfg):
 
     if accelerator.is_main_process:
         save_ckpt("model_final.pt", cfg.epochs - 1)
+        if _wa is not None and _wa.n > 0:
+            print(f"[weight_avg] {_wa.report(accelerator.unwrap_model(cbet_model))}")
+            _raw = accelerator.unwrap_model(cbet_model)
+            _live_sd = {k: v.detach().clone() for k, v in _raw.state_dict().items()}
+            try:
+                _avg_sd = _wa.state_dict(_raw)
+                torch.save({"model": _avg_sd, "optimizer": optimizer.state_dict(),
+                            "epoch": int(cfg.epochs - 1),
+                            "weight_avg_mode": str(_wa_mode),
+                            "weight_avg_snapshots": int(_wa.n),
+                            "wandb_run_id": (wandb.run.id if do_wandb and wandb.run is not None
+                                             else None)},
+                           ckpt_dir / "model_avg.pt")
+                print(f"[weight_avg] wrote checkpoints/model_avg.pt "
+                      f"({_wa.n} snapshots, mode={_wa_mode})")
+                # Coherence check B needs: averaging logits-producing weights can flatten the
+                # codebook posterior. equal_total_code_rate on the averaged weights against the
+                # live weights is the direct read. A large drop means the average is incoherent
+                # and model_avg.pt must not be carried forward.
+                if test_loader is not None and not use_diffusion:
+                    _rates = {}
+                    for _tag, _sd in (("live", _live_sd), ("avg", _avg_sd)):
+                        _raw.load_state_dict(_sd)
+                        _raw.eval()
+                        _acc, _cnt = 0.0, 0
+                        with torch.no_grad():
+                            for _b in test_loader:
+                                _, _l, _ld = run_model(_b)
+                                if _l is None:
+                                    continue
+                                if "equal_total_code_rate" in _ld:
+                                    _acc += float(_ld["equal_total_code_rate"]); _cnt += 1
+                        _rates[_tag] = (_acc / _cnt) if _cnt else float("nan")
+                    print(f"[weight_avg] equal_total_code_rate live={_rates.get('live'):.4f} "
+                          f"avg={_rates.get('avg'):.4f}")
+                    if do_wandb:
+                        wandb.log({"weight_avg/code_rate_live": _rates.get("live"),
+                                   "weight_avg/code_rate_avg": _rates.get("avg"),
+                                   "weight_avg/snapshots": int(_wa.n), "epoch": cfg.epochs})
+                _raw.load_state_dict(_live_sd)   # leave the process holding the live weights
+            except Exception as _e:
+                print(f"[weight_avg] failed, model_avg.pt not written: {_e}")
+                traceback.print_exc()
         if _sel_metric:
             if _sel_epoch is None:
                 print(f"[select] {_sel_metric} never appeared in any eval, so no model_best.pt "
@@ -1188,13 +1354,18 @@ def eval_on_env(cfg, encoder, policy, device, use_diffusion, epoch=0, out_dir=No
 
         # per-step goal tracking, ever-reached (max success) and closest approach (min dist)
         ever_succ = np.zeros(n_envs, dtype=bool)
+        # E5/E6: the step at which each episode FIRST reached its goal, -1 if it never did. The
+        # reported metric is "reached at any step", so every step after the first hit is wasted
+        # cost -- and the distribution of this field is exactly what says where eval_horizon could
+        # be truncated (E6). Written per episode into eval_episodes_*.csv.
+        first_hit = np.full(n_envs, -1, dtype=np.int64)
         best_dist = np.full(n_envs, np.inf)
         last_succ, last_dist = None, None
         last_pos = None   # most recent (b, S) state, for the path integral
         path_len = np.zeros(n_envs)   # cumulative distance travelled
         ep_reward = np.zeros(n_envs, dtype=float)   # cumulative reward per episode
 
-        def track(info):
+        def track(info, step_idx=None):
             nonlocal last_succ, last_dist, last_pos, path_len
             # only COVERAGE task passes (pusht) skip the per-step eval_state round-trip, every
             # other pass, goal, random_state, wall/non-coverage task needs success/distance, so it
@@ -1209,6 +1380,8 @@ def eval_on_env(cfg, encoder, policy, device, use_diffusion, epoch=0, out_dir=No
             last_pos = cur.copy()
             r = env.eval_state(goal_states, cur)
             last_succ = np.asarray(r["success"]).astype(bool)
+            if step_idx is not None:
+                first_hit[:] = np.where((first_hit < 0) & last_succ, int(step_idx), first_hit)
             ever_succ[:] = ever_succ | last_succ
             dk = "state_dist" if "state_dist" in r else (
                 "chamfer_distance" if "chamfer_distance" in r else None)
@@ -1268,9 +1441,18 @@ def eval_on_env(cfg, encoder, policy, device, use_diffusion, epoch=0, out_dir=No
                 else:
                     curr_action = action[:, -1, 0, :].cpu().numpy()
                 obs, rew, done, info = step_env(curr_action)
-                rec(obs["visual"]); track(info)
+                rec(obs["visual"]); track(info, steps)
                 obs_stack.append(embed(obs["visual"]))
                 ep_reward += np.asarray(rew, dtype=float); last_info = info; steps += 1
+                # E5: stop once EVERY episode in this batch has reached its goal. The reported
+                # metric is max_success_rate, "reached at any step", so nothing after this point
+                # can change it, nor can it change closest_goal_dist. It DOES change
+                # final_success_rate and final_goal_dist, neither of which this project uses.
+                # Episodes that have not succeeded still run the full horizon, so the
+                # first_success_step distribution stays unbiased.
+                if (not coverage_task) and bool(cfg.get("eval_break_on_success", True)) \
+                        and ever_succ.all():
+                    break
 
         # coverage from the env's own info, final + max over the episode
         if last_info is not None and "final_coverage" in last_info[0]:
@@ -1291,6 +1473,7 @@ def eval_on_env(cfg, encoder, policy, device, use_diffusion, epoch=0, out_dir=No
                     "goal_dist": float(np.linalg.norm(
                         np.asarray(goal_states)[_i][:2] - np.asarray(init_states)[_i][:2])),
                     "success_max": float(ever_succ[_i]),
+                    "first_success_step": float(first_hit[_i]),
                     "success_final": float(last_succ[_i]),
                     "closest_dist": float(best_dist[_i]),
                     "final_x": (float(last_pos[_i][0]) if last_pos is not None else float("nan")),
@@ -1320,7 +1503,11 @@ def eval_on_env(cfg, encoder, policy, device, use_diffusion, epoch=0, out_dir=No
             print(f"saved {len(local_film)} eval videos (batch {b}) to {video_dir}")
     if _ep_records and out_dir is not None:
         import csv
-        _csv = Path(out_dir) / f"eval_episodes_{pass_name or 'all'}.csv"
+        # B3, fixed 2026-11-24: the epoch is in the name now. Without it every evaluation
+        # overwrote the previous one and only the final evaluation's rows survived, so the
+        # per-episode record could not be read for any earlier epoch. Videos already carried the
+        # epoch; this did not.
+        _csv = Path(out_dir) / f"eval_episodes_{pass_name or 'all'}_epoch{epoch}.csv"
         with open(_csv, "w", newline="") as _f:
             _w = csv.DictWriter(_f, fieldnames=list(_ep_records[0].keys()))
             _w.writeheader()

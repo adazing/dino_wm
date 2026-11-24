@@ -59,7 +59,7 @@ class PushTWrapper(PushTEnv):
                         rs.randint(50, 450),
                         rs.randint(100, 400),
                         rs.randint(100, 400),
-                        rs.randn() * 2 * np.pi - np.pi,
+                        rs.rand() * 2 * np.pi - np.pi,   # B17: was randn, which is unbounded
                         0,
                         0,  # agent velocities default 0
                     ]
@@ -71,7 +71,7 @@ class PushTWrapper(PushTEnv):
                         rs.randint(50, 450),
                         rs.randint(100, 400),
                         rs.randint(100, 400),
-                        rs.randn() * 2 * np.pi - np.pi,
+                        rs.rand() * 2 * np.pi - np.pi,   # B17: was randn, which is unbounded
                     ]
                 )
         
