@@ -1,0 +1,39 @@
+/scratch/aml9605/dagger/w_bc3000/rounds/round_00/train	++eval_env_override.fix_wall_location=32 ++eval_env_override.fix_door_location=30
+/scratch/aml9605/dagger/w_bc3000/rounds/round_00/train	++eval_env_override.fix_wall_location=36 ++eval_env_override.fix_door_location=30
+/scratch/aml9605/dagger/w_bc3000/rounds/round_00/train	++eval_env_override.fix_wall_location=40 ++eval_env_override.fix_door_location=30
+/scratch/aml9605/dagger/w_bc3000/rounds/round_00/train	++eval_env_override.fix_wall_location=44 ++eval_env_override.fix_door_location=30
+/scratch/aml9605/dagger/w_bc3000/rounds/round_00/train	++eval_env_override.fix_wall_location=32 ++eval_env_override.fix_door_location=38
+/scratch/aml9605/dagger/w_bc3000/rounds/round_00/train	++eval_env_override.fix_wall_location=32 ++eval_env_override.fix_door_location=46
+/scratch/aml9605/dagger/w_bc3000/rounds/round_00/train	++eval_env_override.fix_wall_location=32 ++eval_env_override.fix_door_location=54
+/scratch/aml9605/dagger/w_mix3000/rounds/round_09/train	++eval_env_override.fix_wall_location=32 ++eval_env_override.fix_door_location=30
+/scratch/aml9605/dagger/w_mix3000/rounds/round_09/train	++eval_env_override.fix_wall_location=36 ++eval_env_override.fix_door_location=30
+/scratch/aml9605/dagger/w_mix3000/rounds/round_09/train	++eval_env_override.fix_wall_location=40 ++eval_env_override.fix_door_location=30
+/scratch/aml9605/dagger/w_mix3000/rounds/round_09/train	++eval_env_override.fix_wall_location=44 ++eval_env_override.fix_door_location=30
+/scratch/aml9605/dagger/w_mix3000/rounds/round_09/train	++eval_env_override.fix_wall_location=32 ++eval_env_override.fix_door_location=38
+/scratch/aml9605/dagger/w_mix3000/rounds/round_09/train	++eval_env_override.fix_wall_location=32 ++eval_env_override.fix_door_location=46
+/scratch/aml9605/dagger/w_mix3000/rounds/round_09/train	++eval_env_override.fix_wall_location=32 ++eval_env_override.fix_door_location=54
+/scratch/aml9605/dagger/w_ftfail2/rounds/round_09/train	++eval_env_override.fix_wall_location=32 ++eval_env_override.fix_door_location=30
+/scratch/aml9605/dagger/w_ftfail2/rounds/round_09/train	++eval_env_override.fix_wall_location=36 ++eval_env_override.fix_door_location=30
+/scratch/aml9605/dagger/w_ftfail2/rounds/round_09/train	++eval_env_override.fix_wall_location=40 ++eval_env_override.fix_door_location=30
+/scratch/aml9605/dagger/w_ftfail2/rounds/round_09/train	++eval_env_override.fix_wall_location=44 ++eval_env_override.fix_door_location=30
+/scratch/aml9605/dagger/w_ftfail2/rounds/round_09/train	++eval_env_override.fix_wall_location=32 ++eval_env_override.fix_door_location=38
+/scratch/aml9605/dagger/w_ftfail2/rounds/round_09/train	++eval_env_override.fix_wall_location=32 ++eval_env_override.fix_door_location=46
+/scratch/aml9605/dagger/w_ftfail2/rounds/round_09/train	++eval_env_override.fix_wall_location=32 ++eval_env_override.fix_door_location=54
+/scratch/aml9605/dagger/w_bc3000/rounds/round_00/train	++env.kwargs.wall_color=red
+/scratch/aml9605/dagger/w_bc3000/rounds/round_00/train	++env.kwargs.agent_color=blue
+/scratch/aml9605/dagger/w_bc3000/rounds/round_00/train	++env.kwargs.bg_color=grey
+/scratch/aml9605/dagger/w_bc3000/rounds/round_00/train	++env.kwargs.obs_corruption=blur
+/scratch/aml9605/dagger/w_bc3000/rounds/round_00/train	++env.kwargs.obs_corruption=snp1
+/scratch/aml9605/dagger/w_bc3000/rounds/round_00/train	++env.kwargs.obs_corruption=snp5
+/scratch/aml9605/dagger/w_bc3000/rounds/round_00/train	++env.kwargs.obs_corruption=dark
+/scratch/aml9605/dagger/p_bc3000/rounds/round_00/train	++env.kwargs.color=red
+/scratch/aml9605/dagger/p_bc3000/rounds/round_00/train	++env.kwargs.agent_color=red
+/scratch/aml9605/dagger/p_bc3000/rounds/round_00/train	++env.kwargs.goal_color=red
+/scratch/aml9605/dagger/p_bc3000/rounds/round_00/train	++env.kwargs.obs_corruption=blur
+/scratch/aml9605/dagger/p_bc3000/rounds/round_00/train	++env.kwargs.obs_corruption=snp1
+/scratch/aml9605/dagger/p_bc3000/rounds/round_00/train	++env.kwargs.obs_corruption=snp5
+/scratch/aml9605/dagger/p_bc3000/rounds/round_00/train	++env.kwargs.obs_corruption=dark
+/scratch/aml9605/dagger/w_bc3000/rounds/round_00/train	++eval_goal_render=env
+/scratch/aml9605/dagger/w_mix3000/rounds/round_09/train	++eval_goal_render=env
+/scratch/aml9605/dagger/w_ftfail2/rounds/round_09/train	++eval_goal_render=env
+/scratch/aml9605/dagger/p_bc3000/rounds/round_00/train	++eval_goal_render=env
