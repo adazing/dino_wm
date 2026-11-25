@@ -753,9 +753,21 @@ def main(cfg):
         # data_source settings: on planned-only data one epoch is a few hundred optimizer steps,
         # while data_source=both with uncapped demos makes one epoch over a hundred thousand.
         # Leaving these null keeps whatever train_overrides says.
+        # The weight_avg_* keys live in the train_policy config, so they have to be forwarded
+        # explicitly. Without this, setting policy_weight_avg on the DAGGER config did nothing:
+        # no model_avg.pt was written and policy_ckpt_select=avg silently fell back to
+        # model_final.pt, so an averaging arm would have measured the wrong thing. Added
+        # 2026-11-25. Each is forwarded only when set, so an arm that does not set them is
+        # unaffected.
         for _key, _cfg_key in (("epochs", "policy_epochs"),
                                ("eval_on_env_freq", "policy_eval_on_env_freq"),
-                               ("windows_per_epoch", "policy_windows_per_epoch")):
+                               ("windows_per_epoch", "policy_windows_per_epoch"),
+                               ("policy_weight_avg", "policy_weight_avg"),
+                               ("weight_avg_every", "weight_avg_every"),
+                               ("weight_avg_start_epoch", "weight_avg_start_epoch"),
+                               ("weight_avg_ema_power", "weight_avg_ema_power"),
+                               ("select_metric", "policy_select_metric"),
+                               ("select_mode", "policy_select_mode")):
             _val = cfg.get(_cfg_key, None)
             if _val is not None:
                 cmd += [f"++{_key}={_val}"]
