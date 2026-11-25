@@ -317,6 +317,30 @@ class Trainer:
         # same ratio even as the pool grows. Give a fraction for all but ONE active group; the
         # omitted one takes the remainder. Fractions override the max_*_windows caps.
         _frac = None
+        # B4, fixed 2026-11-25. An UNCAPPED fine-tune trains on the entire accumulated pool,
+        # which grows by a round's worth of trajectories every round, so round 9 sees roughly ten
+        # times round 0's data and no two rounds are comparable. DAGGER_README-adaBot.md states
+        # the rule -- never leave total_windows null -- but nothing enforced it: both dagger
+        # configs ship total_windows: null and every max_*_windows: null, so an arm whose override
+        # list omits the cap failed silently and the only symptom was a long round.
+        #
+        # The guard fires only when a planner pool is in the mix. Pretraining from scratch has no
+        # planned_data_path and legitimately uses all of its data. allow_uncapped_finetune=true is
+        # the escape hatch, so an uncapped run is a deliberate choice rather than an oversight.
+        _groups = ["demo", "rollout"] + sorted(sel_of)
+        if (self.cfg.get("planned_data_path", None)
+                and self.cfg.get("total_windows", None) is None
+                and all(self.cfg.get(f"max_{g}_windows", None) is None for g in _groups)
+                and not bool(self.cfg.get("allow_uncapped_finetune", False))):
+            raise ValueError(
+                "this fine-tune is UNCAPPED: planned_data_path is set but total_windows and every "
+                f"max_<group>_windows ({', '.join('max_%s_windows' % g for g in _groups)}) are "
+                "null, so it would train on the whole accumulated pool and grow every round. Set "
+                "wm_total_windows with the wm_frac_<group> mix (e.g. wm_total_windows=500 "
+                "wm_frac_failure=0.8 wm_frac_success=0.1), or a wm_max_<group>_windows cap, or "
+                "pass allow_uncapped_finetune=true to do it on purpose. See "
+                "CODE_AUDIT-adaBot.md B4.")
+
         _total = self.cfg.get("total_windows", None)
         if _total is not None:
             _total = int(_total)

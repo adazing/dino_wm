@@ -24,21 +24,48 @@ import torch
 from omegaconf import OmegaConf
 
 
-def load_run_cfg(run_dir: Path):
-    """The resolved config the run was launched with, from the wandb snapshot.
+def load_run_cfg(run_dir: Path, rnd=None):
+    """The config the POLICY was trained with, for the round being replayed.
 
-    dagger_wall.yaml sets hydra.output_subdir=null, so wandb's copy is the only record on disk.
-    Its entries are {key: {desc, value}}, so unwrap 'value'.
+    B8, fixed 2026-11-24. This used to read only the wandb snapshot at
+    wandb/*/files/config.yaml, and raised when it was absent -- which is every offline run.
+    Verified on a live arm: the wandb directories exist but their files/ holds only
+    conda-environment.yaml, requirements.txt and wandb-metadata.json. The sbatch script sets
+    WANDB_MODE=offline by default, so this diagnostic had been failing with exit 1 on every round
+    of every arm, losing the only planner-versus-policy comparison on identical tasks.
+
+    The training subprocess writes its own Hydra snapshot to
+    rounds/round_NN/train/.hydra/config.yaml, and every key this tool reads is a train_policy-level
+    setting (action_window_size, window_size, num_hist, num_pred, frameskip, img_size, encoder,
+    policy, env.dataset, env.goal_dim, n_envs, goal_conditional). So that snapshot is both
+    available and more authoritative than the wandb copy, because it records the settings the
+    checkpoint was actually built with. Prefer the round being replayed, fall back to any round,
+    and keep the wandb path for runs recorded online.
     """
+    cands = []
+    if rnd is not None:
+        cands.append(run_dir / "rounds" / f"round_{int(rnd):02d}" / "train" / ".hydra"
+                     / "config.yaml")
+    cands += sorted(run_dir.glob("rounds/round_*/train/.hydra/config.yaml"), reverse=True)
+    for c in cands:
+        if c.is_file():
+            print(f"[cfg] loaded from {c}")
+            return OmegaConf.load(c)
+
+    # Online runs: wandb writes its own copy, with entries shaped {key: {desc, value}}.
     hits = sorted(run_dir.glob("wandb/*/files/config.yaml"))
-    if not hits:
-        raise FileNotFoundError(
-            f"no wandb/*/files/config.yaml under {run_dir}. That snapshot is the only on-disk "
-            f"copy of the launch config, so this run cannot be replayed.")
-    raw = OmegaConf.to_container(OmegaConf.load(hits[-1]), resolve=False)
-    flat = {k: (v.get("value") if isinstance(v, dict) and "value" in v else v)
-            for k, v in raw.items() if not k.startswith("_")}
-    return OmegaConf.create(flat)
+    if hits:
+        print(f"[cfg] loaded from {hits[-1]} (wandb snapshot)")
+        raw = OmegaConf.to_container(OmegaConf.load(hits[-1]), resolve=False)
+        flat = {k: (v.get("value") if isinstance(v, dict) and "value" in v else v)
+                for k, v in raw.items() if not k.startswith("_")}
+        return OmegaConf.create(flat)
+
+    raise FileNotFoundError(
+        f"no launch config found under {run_dir}. Looked for "
+        f"rounds/round_*/train/.hydra/config.yaml (written by the training subprocess) and "
+        f"wandb/*/files/config.yaml (written only by ONLINE wandb runs). Without one of these "
+        f"the run cannot be replayed.")
 
 
 def planner_rate(run_dir: Path, rnd: int):
@@ -158,7 +185,14 @@ def main():
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir)
-    cfg = load_run_cfg(run_dir)
+    # resolved BEFORE the config, so load_run_cfg can read the snapshot belonging to the round
+    # actually being replayed rather than an arbitrary one (B8).
+    rounds = ([int(x) for x in args.rounds.split(",")] if args.rounds
+              else sorted(int(p.parent.name.split("_")[1])
+                          for p in run_dir.glob("rounds/round_*/relabel_states.pth")))
+    if not rounds:
+        raise SystemExit(f"no rounds/round_*/relabel_states.pth under {run_dir}")
+    cfg = load_run_cfg(run_dir, rounds[0])
     horizons = [int(h) for h in args.horizons.split(",")]
 
     import hydra
@@ -173,12 +207,6 @@ def main():
     OmegaConf.update(cfg, "policy.goal_dim", int(cfg.env.goal_dim), force_add=True)
     print(f"[cfg] goal_conditional={bool(cfg.get('goal_conditional', False))} "
           f"policy.goal_dim={cfg.policy.goal_dim} obs_dim={cfg.policy.get('obs_dim')}")
-
-    rounds = ([int(x) for x in args.rounds.split(",")] if args.rounds
-              else sorted(int(p.parent.name.split("_")[1])
-                          for p in run_dir.glob("rounds/round_*/relabel_states.pth")))
-    if not rounds:
-        raise SystemExit(f"no rounds/round_*/relabel_states.pth under {run_dir}")
 
     # Action stats come from the demo dataset's valid split, the same source train_policy uses
     # to denormalize at eval. The policy's actions are meaningless in the env without them.
